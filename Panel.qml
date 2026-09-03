@@ -435,7 +435,7 @@ Panel {
                                 Layout.fillWidth: true
                                 spacing: Style.space(6)
                                 Label { textFormat: Text.PlainText; text: "File *"; font.pixelSize: Style.font.caption; color: Color.muted }
-                                TextField { Layout.fillWidth: true; text: root.importFile; placeholderText: "/path/to/file.ova"; font.pixelSize: Style.font.caption; onTextChanged: root.importFile = text; elide: Text.ElideMiddle }
+                                TextField { Layout.fillWidth: true; text: root.importFile; placeholderText: "/path/to/file.ova"; font.pixelSize: Style.font.caption; onTextChanged: root.importFile = text }
                                 Button { iconText: "󰉋"; fontFamily: "JetBrainsMono Nerd Font"; fontSize: Style.font.caption; tooltipText: "Browse OVA/VMDK…"; Layout.preferredWidth: Style.space(28); onClicked: importFilePicker.running = true }
                             }
                             RowLayout {
