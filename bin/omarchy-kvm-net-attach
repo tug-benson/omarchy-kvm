@@ -13,29 +13,26 @@ def run(cmd, timeout=10):
     return p.stdout, p.stderr, p.returncode
 
 def list_host_bridges():
-    """List host bridges via ip link and nmcli."""
+    """List host bridges via ip link - only those that actually exist."""
     bridges = []
-    # Get bridges via ip link
+    # Get bridges via ip link (only active bridges)
     out, _, _ = run(["ip", "-o", "link", "show", "type", "bridge"])
     for line in out.splitlines():
-        # e.g., "11: virbr0: <BROADCAST,MULTICAST,UP,LOWER_UP> ..."
         m = re.search(r"\d+: (\w+):", line)
         if m:
             bridges.append(m.group(1))
-    # Also check for br0 via nmcli or ip
-    out2, _, _ = run(["ip", "link", "show"])
-    for line in out2.splitlines():
-        if "br0:" in line:
-            if "br0" not in bridges:
-                bridges.append("br0")
-    # Check via virsh iface-list
+    # Check via virsh iface-list for active bridges only
     out3, _, _ = run(["virsh", "--connect", "qemu:///system", "iface-list", "--all"])
     for line in out3.splitlines():
         parts = line.split()
-        if len(parts) >= 1 and parts[0] not in ["Name", "----------------------------------------"]:
+        if len(parts) >= 2 and parts[1] == "active":
             iface = parts[0]
             if iface.startswith("br") and iface not in bridges:
                 bridges.append(iface)
+    # Only add br0 if it actually exists as an interface (check via ip link show br0)
+    out4, _, code4 = run(["ip", "link", "show", "br0"])
+    if code4 == 0 and "br0" not in bridges:
+        bridges.append("br0")
     return sorted(set(bridges))
 
 def list_libvirt_networks():
@@ -128,6 +125,17 @@ def main():
         if src_type not in ["network", "bridge"]:
             print("src_type must be network or bridge", file=sys.stderr)
             sys.exit(2)
+        # Validate bridge exists if type is bridge
+        if src_type == "bridge":
+            out_br, _, code_br = run(["ip", "link", "show", source])
+            if code_br != 0:
+                print(f"Error: Bridge '{source}' does not exist on host.", file=sys.stderr)
+                print(f"Create it first (see https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/):", file=sys.stderr)
+                print(f"  nmcli connection add type bridge ifname {source} con-name {source}", file=sys.stderr)
+                print(f"  nmcli connection add type bridge-slave ifname enp5s0 master {source}  # replace enp5s0 with your iface", file=sys.stderr)
+                print(f"  nmcli connection up {source}", file=sys.stderr)
+                print(f"Or via ip: ip link add {source} type bridge && ip link set {source} up", file=sys.stderr)
+                sys.exit(1)
         # Check VM exists and get current interface to detach
         info, err = get_vm_interface(vm)
         if info is None:
@@ -136,14 +144,13 @@ def main():
         # Check if VM is running
         out, _, _ = run(["virsh", "--connect", "qemu:///system", "dominfo", vm])
         is_running = "running" in out.lower()
-        # Detach old interface
-        # Use virsh detach-interface
-        # First, try to detach the current interface
-        # For detach, we need to know the type and source, but detach-interface can work with --type and --source
-        # Let's try: virsh detach-interface <vm> --type <type> --source <source> [--live|--config]
-        # If that fails, try to use virsh update-device with edited XML
-        print(f"Detaching old interface {info['type']}:{info['source']} from {vm}...", flush=True)
-        detach_cmd = ["virsh", "--connect", "qemu:///system", "detach-interface", vm, info['type'], "--source", info['source']]
+        # Detach old interface - use --mac for detach (more reliable than --source)
+        print(f"Detaching old interface {info['type']}:{info['source']} (mac {info['mac']}) from {vm}...", flush=True)
+        # Prefer --mac for detach as per virsh detach-interface --help
+        if info['mac']:
+            detach_cmd = ["virsh", "--connect", "qemu:///system", "detach-interface", vm, "--type", info['type'], "--mac", info['mac']]
+        else:
+            detach_cmd = ["virsh", "--connect", "qemu:///system", "detach-interface", vm, info['type'], "--source", info['source']]
         if is_running and live:
             detach_cmd.append("--live")
         else:

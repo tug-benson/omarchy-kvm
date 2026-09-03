@@ -867,6 +867,47 @@ Panel {
                                                         onClicked: { service.fetchVmNet(row.vmName); service.refreshHostNetworks() }
                                                     }
                                                 }
+                                                Label {
+                                                    visible: netTypeDropdown.value === "bridge" && service && service.hostBridges.indexOf(service.vmNetSource) === -1
+                                                    Layout.fillWidth: true
+                                                    textFormat: Text.PlainText
+                                                    text: "Bridge '" + (service ? service.vmNetSource : "") + "' not found. Create it first: nmcli connection add type bridge ifname " + (service ? service.vmNetSource : "br0") + " con-name " + (service ? service.vmNetSource : "br0") + " && nmcli connection up " + (service ? service.vmNetSource : "br0")
+                                                    font.pixelSize: Style.font.caption - 1
+                                                    color: Color.urgent
+                                                    wrapMode: Text.Wrap
+                                                }
+                                                // Result of network change (persistent)
+                                                Rectangle {
+                                                    Layout.fillWidth: true
+                                                    visible: service && (service.vmNetLastResult || service.vmNetLastError)
+                                                    radius: 4
+                                                    color: service && service.vmNetLastError ? Util.alpha(Color.urgent, 0.12) : Util.alpha(Color.accent, 0.08)
+                                                    border.color: service && service.vmNetLastError ? Util.alpha(Color.urgent, 0.3) : Util.alpha(Color.accent, 0.2)
+                                                    border.width: 1
+                                                    implicitHeight: netResultCol.implicitHeight + 8
+                                                    ColumnLayout {
+                                                        id: netResultCol
+                                                        anchors.fill: parent
+                                                        anchors.margins: 6
+                                                        spacing: 4
+                                                        Label {
+                                                            Layout.fillWidth: true
+                                                            textFormat: Text.PlainText
+                                                            text: service ? (service.vmNetLastError ? service.vmNetLastError : service.vmNetLastResult) : ""
+                                                            font.family: "JetBrainsMono Nerd Font"
+                                                            font.pixelSize: Style.font.caption - 1
+                                                            color: service && service.vmNetLastError ? Color.urgent : Color.accent
+                                                            wrapMode: Text.Wrap
+                                                        }
+                                                        RowLayout {
+                                                            Layout.fillWidth: true
+                                                            visible: service && service.vmNetLastResult
+                                                            spacing: Style.space(4)
+                                                            Button { text: "⎘ Copy"; fontSize: Style.font.caption -1; Layout.fillWidth: true; onClicked: root.copyToClipboard(service.vmNetLastResult) }
+                                                            Button { text: "Dismiss"; fontSize: Style.font.caption -1; Layout.fillWidth: true; onClicked: { service.vmNetLastResult=""; service.vmNetLastError="" } }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
 

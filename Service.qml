@@ -466,6 +466,8 @@ Item {
     property string vmNetInfo: ""
     property string vmNetSource: ""
     property string vmNetType: ""
+    property string vmNetLastResult: ""
+    property string vmNetLastError: ""
     property var hostBridges: []
     property var libvirtNetworks: []
     Process {
@@ -518,6 +520,7 @@ Item {
         hostNetProc.command = ["python3", root.scriptPath("omarchy-kvm-net-attach"), "list-all"]
         hostNetProc.running = true
     }
+    property string lastVmNetVm: ""
     Process {
         id: vmNetSetProc
         stdout: StdioCollector { id: vmNetSetOut; waitForEnd: true }
@@ -526,23 +529,26 @@ Item {
         onRunningChanged: { if (running) { timedOut=false; vmNetSetDeadline.restart(); root.busy=true } else { vmNetSetDeadline.stop(); root.busy=false } }
         onExited: function(code) {
             vmNetSetDeadline.stop(); root.busy=false
-            if (timedOut) { root.lastError="network change timeout"; return }
+            if (timedOut) { root.lastError="network change timeout"; root.vmNetLastError="timeout"; return }
             var out = vmNetSetOut.text.trim()
             var err = vmNetSetErr.text.trim()
             if (code === 0) {
                 root.lastError=""; root.lastInfo=out.substring(0,400) || "Network updated"
-                // Refresh VM net info
-                if (root.lastDiskPath) {
-                    // Use lastDiskPath as vm name? No, need to store last vm
-                }
+                root.vmNetLastResult=out.substring(0,600) || "Network updated"
+                root.vmNetLastError=""
+                if (root.lastVmNetVm) fetchVmNet(root.lastVmNetVm)
             } else {
-                root.lastError=(err||out).substring(0,600)
+                var msg=(err||out).substring(0,600)
+                root.lastError=msg
+                root.vmNetLastError=msg
+                root.vmNetLastResult=""
             }
         }
     }
     Timer { id: vmNetSetDeadline; interval: 20000; onTriggered: { vmNetSetProc.timedOut=true; vmNetSetProc.running=false } }
     function setVmNetwork(vm, srcType, source, live) {
-        if (!vm || !srcType || !source) { root.lastError="vm, type and source required"; return }
+        if (!vm || !srcType || !source) { root.lastError="vm, type and source required"; root.vmNetLastError="vm, type and source required"; return }
+        root.lastVmNetVm = vm
         var cmd = ["python3", root.scriptPath("omarchy-kvm-net-attach"), "set", vm, srcType, source]
         if (live) cmd.push("--live")
         vmNetSetProc.command = cmd
