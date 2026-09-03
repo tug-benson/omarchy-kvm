@@ -53,6 +53,8 @@ Panel {
     property bool settingsCollapsed: true
     property string newPoolPath: ""
     property string newPoolName: ""
+    property string newDiskPath: ""
+    property string diskPickerVm: ""
 
     // zenity pickers (avoid native FileDialog crash in layer-shell)
     Process {
@@ -76,6 +78,18 @@ Panel {
             if (code === 0) {
                 var p = poolDirOut.text.trim()
                 if (p) root.newPoolPath = p
+            }
+        }
+    }
+    Process {
+        id: diskPicker
+        command: ["zenity", "--file-selection", "--title=Select disk image", "--file-filter=Disk images | *.qcow2 *.img *.raw", "--file-filter=All files | *"]
+        stdout: StdioCollector { id: diskPickerOut; waitForEnd: true }
+        stderr: StdioCollector { waitForEnd: true }
+        onExited: function(code) {
+            if (code === 0) {
+                var p = diskPickerOut.text.trim()
+                if (p) root.newDiskPath = p
             }
         }
     }
@@ -547,6 +561,80 @@ Panel {
                                             Button { text: "Apply HW"; fontSize: Style.font.caption; Layout.fillWidth: true; onClicked: { service.setVcpus(row.vmName, root.editVcpu, liveChk.checked); service.setMemory(row.vmName, root.editMem, liveChk.checked) } }
                                         }
                                         Label { visible: row.isRunning && !liveChk.checked; Layout.fillWidth: true; textFormat: Text.PlainText; text: "VM running — coche Live ou arrête la VM pour appliquer à froid."; font.pixelSize: Style.font.caption-1; color: Color.urgent; wrapMode: Text.Wrap }
+
+                                        // disk relink (after pool move)
+                                        Rectangle {
+                                            Layout.fillWidth: true
+                                            visible: true
+                                            radius: 4
+                                            color: Util.alpha(Color.foreground,0.04)
+                                            border.color: Util.alpha(Color.foreground,0.08)
+                                            border.width: 1
+                                            implicitHeight: diskRelinkCol.implicitHeight + 8
+                                            ColumnLayout {
+                                                id: diskRelinkCol
+                                                anchors.fill: parent
+                                                anchors.margins: 6
+                                                spacing: 4
+                                                Label {
+                                                    textFormat: Text.PlainText
+                                                    text: "Disk"
+                                                    font.pixelSize: Style.font.caption
+                                                    font.bold: true
+                                                    color: Color.foreground
+                                                }
+                                                Label {
+                                                    Layout.fillWidth: true
+                                                    textFormat: Text.PlainText
+                                                    text: service ? (service.lastDiskPath ? service.lastDiskPath : "—") : "—"
+                                                    font.family: "JetBrainsMono Nerd Font"
+                                                    font.pixelSize: Style.font.caption - 1
+                                                    color: Color.muted
+                                                    wrapMode: Text.Wrap
+                                                    elide: Text.ElideMiddle
+                                                    MouseArea {
+                                                        anchors.fill: parent
+                                                        cursorShape: Qt.PointingHandCursor
+                                                        onClicked: if (service) service.fetchDiskPath(row.vmName)
+                                                    }
+                                                }
+                                                RowLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: Style.space(4)
+                                                    TextField {
+                                                        Layout.fillWidth: true
+                                                        placeholderText: "/home/user/VMs/disk.qcow2"
+                                                        text: root.newDiskPath
+                                                        font.pixelSize: Style.font.caption
+                                                        onTextChanged: root.newDiskPath = text
+                                                    }
+                                                    Button {
+                                                        iconText: "󰉋"
+                                                        fontFamily: "JetBrainsMono Nerd Font"
+                                                        fontSize: Style.font.caption
+                                                        tooltipText: "Browse disk…"
+                                                        Layout.preferredWidth: Style.space(28)
+                                                        onClicked: { root.diskPickerVm = row.vmName; diskPicker.running = true }
+                                                    }
+                                                    Button {
+                                                        text: "Relink"
+                                                        fontSize: Style.font.caption
+                                                        Layout.preferredWidth: Style.space(50)
+                                                        enabled: root.newDiskPath.length > 0 && service && !service.busy
+                                                        onClicked: { service.relinkDisk(row.vmName, root.newDiskPath); root.newDiskPath = "" }
+                                                    }
+                                                }
+                                                Label {
+                                                    visible: service && service.lastDiskPath && service.lastDiskPath.indexOf("/var/lib/libvirt/images") !== -1 && service.defaultPoolPath && service.defaultPoolPath.indexOf("/home") !== -1
+                                                    Layout.fillWidth: true
+                                                    textFormat: Text.PlainText
+                                                    text: "⚠ Disk still at old location (/var) but pool now at " + (service ? service.defaultPoolPath : "") + " — relink to new path."
+                                                    font.pixelSize: Style.font.caption - 1
+                                                    color: Color.urgent
+                                                    wrapMode: Text.Wrap
+                                                }
+                                            }
+                                        }
 
                                         // clone + delete row
                                         RowLayout {

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+Relink a VM's disk to a new file path (for when pool was moved and VM still points to old path).
+Uses virsh dumpxml -> edit <source file> -> virsh define.
+Requires VM to be shut off (will check).
+"""
+import re
+import subprocess
+import sys
+import os
+import tempfile
+
+SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+def run(cmd, timeout=10):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return p.stdout, p.stderr, p.returncode
+
+def main():
+    if len(sys.argv) < 3:
+        print("usage: omarchy-kvm-disk-relink <vm-name> <new-disk-path> [--target vda]", file=sys.stderr)
+        print("  vm-name: existing VM (must be shut off)", file=sys.stderr)
+        print("  new-disk-path: absolute path to qcow2 (e.g., /home/user/VMs/disk.qcow2)", file=sys.stderr)
+        sys.exit(2)
+    vm = sys.argv[1]
+    new_path = sys.argv[2]
+    target = "vda"
+    # Parse optional --target
+    for i in range(3, len(sys.argv)):
+        if sys.argv[i] == "--target" and i+1 < len(sys.argv):
+            target = sys.argv[i+1]
+
+    if not SAFE_NAME_RE.match(vm) or len(vm) > 100:
+        print(f"Invalid VM name: {vm}", file=sys.stderr)
+        sys.exit(2)
+    if not os.path.isabs(new_path) or len(new_path) > 512:
+        print(f"Invalid new path: {new_path}", file=sys.stderr)
+        sys.exit(2)
+    if not os.path.exists(new_path):
+        print(f"New disk file not found: {new_path}", file=sys.stderr)
+        sys.exit(2)
+    # Check VM exists and is shut off
+    out, err, code = run(["virsh", "--connect", "qemu:///system", "dominfo", vm])
+    if code != 0:
+        print(f"VM not found or virsh error: {err.strip()}", file=sys.stderr)
+        sys.exit(1)
+    if "State:          running" in out or "State: running" in out:
+        print(f"VM {vm} is running — shut it down first (virsh shutdown {vm})", file=sys.stderr)
+        sys.exit(1)
+    if "State:          paused" in out:
+        print(f"VM {vm} is paused — resume or destroy first", file=sys.stderr)
+        sys.exit(1)
+
+    # Dump XML
+    out, err, code = run(["virsh", "--connect", "qemu:///system", "dumpxml", vm])
+    if code != 0:
+        print(f"dumpxml failed: {err}", file=sys.stderr)
+        sys.exit(1)
+    xml = out
+
+    # Find current disk source for target (e.g., vda)
+    # Pattern: <disk ...><target dev='vda' .../><source file='...'/> or <source file="...">
+    # We need to replace the <source file=...> for the disk with target vda
+    # Simple: replace the first <source file="..."> that is inside a <disk> with <target dev='vda'>
+    # More robust: parse XML and replace
+    # For now, replace all <source file='...'> that are inside disk with target vda
+    # Use regex to find disk blocks
+    disk_pattern = re.compile(r"(<disk[^>]*>.*?<target[^>]*dev=['\"]" + re.escape(target) + r"['\"][^>]*>.*?<source[^>]*file=['\"])([^'\"]+)(['\"][^>]*>)", re.DOTALL)
+    m = disk_pattern.search(xml)
+    if not m:
+        # Fallback: replace the first source file in any disk (for single-disk VMs)
+        # Find first <source file=...>
+        m2 = re.search(r"<source\s+file=['\"]([^'\"]+)['\"]", xml)
+        if not m2:
+            print(f"Could not find <source file> for {target} in domain XML", file=sys.stderr)
+            sys.exit(1)
+        old_path = m2.group(1)
+        print(f"Found disk {old_path} -> will relink to {new_path} (target {target})", flush=True)
+        new_xml = xml.replace(old_path, new_path, 1)
+    else:
+        old_path = m.group(2)
+        print(f"Found disk for {target}: {old_path} -> {new_path}", flush=True)
+        new_xml = disk_pattern.sub(r"\g<1>" + new_path + r"\g<3>", xml, count=1)
+
+    if new_xml == xml:
+        print("No change made to XML (already at new path?)", file=sys.stderr)
+        sys.exit(1)
+
+    # Write to temp file and define
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False, dir='/tmp') as f:
+        f.write(new_xml)
+        tmp_xml = f.name
+
+    try:
+        print(f"Redefining domain {vm} with new disk path...", flush=True)
+        out2, err2, code2 = run(["virsh", "--connect", "qemu:///system", "define", tmp_xml])
+        if code2 != 0:
+            print(f"virsh define failed: {err2}", file=sys.stderr)
+            # Show diff for debugging
+            print(f"Old path: {old_path}", file=sys.stderr)
+            print(f"New path: {new_path}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✓ Domain {vm} redefined: {old_path} → {new_path}", flush=True)
+        # Verify
+        out3, _, _ = run(["virsh", "--connect", "qemu:///system", "domblklist", vm])
+        print(out3.strip(), flush=True)
+        # Also check dumpxml
+        out4, _, _ = run(["virsh", "--connect", "qemu:///system", "dumpxml", vm])
+        m3 = re.search(r"<source\s+file=['\"]([^'\"]+)['\"]", out4)
+        if m3 and m3.group(1) == new_path:
+            print(f"Verified: {vm} now at {new_path}", flush=True)
+        else:
+            print(f"Warning: verification failed, still at {m3.group(1) if m3 else 'unknown'}", file=sys.stderr)
+    finally:
+        try:
+            os.unlink(tmp_xml)
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()

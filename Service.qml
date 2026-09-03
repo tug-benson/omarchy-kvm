@@ -346,6 +346,76 @@ Item {
         cloneProc.running=true
     }
 
+    // ── Disk relink (fix after pool move) ──
+    property string lastDiskPath: ""
+    Process {
+        id: diskInfoProc
+        stdout: StdioCollector { id: diskInfoOut; waitForEnd: true }
+        stderr: StdioCollector { id: diskInfoErr; waitForEnd: true }
+        onExited: function(code) {
+            if (code === 0) {
+                var txt = diskInfoOut.text.trim()
+                // Parse "vda      /path/to/disk.qcow2" from domblklist
+                var lines = txt.split("\n")
+                for (var i=0;i<lines.length;i++) {
+                    var l=lines[i].trim()
+                    if (l.indexOf("vda")===0 || l.indexOf("hda")===0 || l.indexOf("sda")===0) {
+                        var parts=l.split(/\s+/)
+                        if (parts.length>=2) {
+                            // parts[0] is target, parts[1] is source, but domblklist --details has more columns
+                            // For domblklist without --details: "vda  /path"
+                            // For --details: "file   disk     vda      /path"
+                            var p = parts[parts.length-1]
+                            if (p && p.indexOf("/")===0) {
+                                root.lastDiskPath=p
+                                break
+                            }
+                        }
+                    }
+                }
+                // Fallback: try dumpxml
+                if (!root.lastDiskPath) {
+                    var m=txt.match(/<source\s+file=['"]([^'"]+)['"]/)
+                    if (m) root.lastDiskPath=m[1]
+                }
+            }
+        }
+    }
+    function fetchDiskPath(vm) {
+        if (!vm) return
+        root.lastDiskPath=""
+        diskInfoProc.command=["virsh", "--connect", "qemu:///system", "domblklist", vm]
+        diskInfoProc.running=true
+    }
+    Process {
+        id: diskRelinkProc
+        stdout: StdioCollector { id: diskRelinkOut; waitForEnd: true }
+        stderr: StdioCollector { id: diskRelinkErr; waitForEnd: true }
+        property bool timedOut: false
+        onRunningChanged: { if (running) { timedOut=false; diskRelinkDeadline.restart(); root.busy=true } else { diskRelinkDeadline.stop(); root.busy=false } }
+        onExited: function(code) {
+            diskRelinkDeadline.stop(); root.busy=false
+            if (timedOut) { root.lastError="relink timeout"; root.poolLastError="relink timeout"; return }
+            var out=diskRelinkOut.text.trim()
+            var err=diskRelinkErr.text.trim()
+            if (code===0) {
+                root.lastError=""; root.lastInfo=out.substring(0,400) || "Disk relinked"
+                root.poolLastResult=out.substring(0,600) || "Disk relinked"
+                root.poolLastError=""
+                refreshDelay.restart()
+            } else {
+                root.lastError=(err||out).substring(0,600)
+                root.poolLastError=(err||out).substring(0,600)
+            }
+        }
+    }
+    Timer { id: diskRelinkDeadline; interval: 15000; onTriggered: { diskRelinkProc.timedOut=true; diskRelinkProc.running=false } }
+    function relinkDisk(vm, newPath) {
+        if (!vm || !newPath) { root.lastError="vm and new path required"; return }
+        diskRelinkProc.command=["python3", root.scriptPath("omarchy-kvm-disk-relink"), vm, newPath]
+        diskRelinkProc.running=true
+    }
+
     // ── Pools ──
     Process {
         id: poolProc
