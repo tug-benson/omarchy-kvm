@@ -37,6 +37,8 @@ Item {
     property var osVariants: []
     property string defaultPoolPath: "/var/lib/libvirt/images"
     property string poolDetailText: ""
+    property string poolLastResult: ""
+    property string poolLastError: ""
 
     // Wizard / tool checks
     property bool wizardRunning: false
@@ -398,11 +400,19 @@ Item {
         onRunningChanged: { if (running) { timedOut=false; poolSetDeadline.restart(); root.busy=true } else { poolSetDeadline.stop(); root.busy=false } }
         onExited: function(code) {
             poolSetDeadline.stop(); root.busy=false
-            if (timedOut) { root.lastError="pool set timeout (30s)"; return }
+            if (timedOut) { root.lastError="pool set timeout (30s)"; root.poolLastError="timeout"; return }
             var out = poolSetOut.text.trim()
             var err = poolSetErr.text.trim()
-            if (code === 0) { root.lastError=""; root.lastInfo=out.substring(0,500) || "Pool location updated"; root.wizardLog+=out+"\n"; refreshPools(); refreshPoolPath() }
-            else root.lastError=(err||out).substring(0,600)
+            if (code === 0) {
+                root.lastError=""; root.lastInfo=out.substring(0,500) || "Pool location updated"
+                root.poolLastResult=out.substring(0,800) || "Pool updated"
+                root.poolLastError=""
+                root.wizardLog+=out+"\n"; refreshPools(); refreshPoolPath()
+            } else {
+                root.lastError=(err||out).substring(0,600)
+                root.poolLastError=(err||out).substring(0,600)
+                root.poolLastResult=""
+            }
         }
     }
     Timer { id: poolSetDeadline; interval: 30000; onTriggered: { poolSetProc.timedOut=true; poolSetProc.running=false } }

@@ -131,18 +131,22 @@ def main():
             print("Failed to update <path> in XML (not found)", file=sys.stderr)
             sys.exit(1)
 
-        # Check if pool is active, destroy if needed
+        # Check if pool is active, destroy if needed (robust check)
         is_active = False
         info_out, _, _ = run(["virsh", "--connect", "qemu:///system", "pool-info", pool_name])
-        if "State:                   running" in info_out or "Active:                  yes" in info_out or "active" in info_out.lower():
-            # Try to destroy
+        # More robust: check for "running" in lower case, as virsh output varies
+        if "running" in info_out.lower():
             print(f"Destroying active pool {pool_name}...", flush=True)
             out2, err2, code2 = run(["virsh", "--connect", "qemu:///system", "pool-destroy", pool_name])
             if code2 != 0:
                 print(f"Warning: pool-destroy failed: {err2} (may already be inactive)", file=sys.stderr)
+                # Try alternative: virsh pool-destroy may fail if pool has volumes, try with --graceful?
+                # Continue anyway to try undefine
             else:
                 print(f"Pool {pool_name} destroyed", flush=True)
                 is_active = True
+        else:
+            print(f"Pool {pool_name} not running (state: {info_out.strip().split(chr(10))[0] if info_out else 'unknown'}), proceeding to undefine...", flush=True)
 
         # Undefine old pool
         print(f"Undefining pool {pool_name}...", flush=True)

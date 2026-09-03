@@ -777,6 +777,48 @@ Panel {
                                         onClicked: service.createPoolAt(root.newPoolName, root.newPoolPath)
                                     }
                                 }
+                                // Result of last pool operation (persistent, with copy/dismiss)
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    visible: service && (service.poolLastResult || service.poolLastError)
+                                    radius: 4
+                                    color: service && service.poolLastError ? Util.alpha(Color.urgent, 0.12) : Util.alpha(Color.accent, 0.08)
+                                    border.color: service && service.poolLastError ? Util.alpha(Color.urgent, 0.3) : Util.alpha(Color.accent, 0.2)
+                                    border.width: 1
+                                    implicitHeight: poolResultCol.implicitHeight + 8
+                                    ColumnLayout {
+                                        id: poolResultCol
+                                        anchors.fill: parent
+                                        anchors.margins: 6
+                                        spacing: 4
+                                        Label {
+                                            Layout.fillWidth: true
+                                            textFormat: Text.PlainText
+                                            text: service ? (service.poolLastError ? service.poolLastError : service.poolLastResult) : ""
+                                            font.family: "JetBrainsMono Nerd Font"
+                                            font.pixelSize: Style.font.caption - 1
+                                            color: service && service.poolLastError ? Color.urgent : Color.accent
+                                            wrapMode: Text.Wrap
+                                        }
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            visible: service && service.poolLastResult
+                                            spacing: Style.space(4)
+                                            Button { text: "⎘ Copy"; fontSize: Style.font.caption -1; Layout.fillWidth: true; onClicked: root.copyToClipboard(service.poolLastResult) }
+                                            Button { text: "Dismiss"; fontSize: Style.font.caption -1; Layout.fillWidth: true; onClicked: { service.poolLastResult=""; service.poolLastError="" } }
+                                        }
+                                    }
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    textFormat: Text.PlainText
+                                    text: "Note: existing VM images stay at old location (/var/lib/libvirt/images). Move them manually with `sudo mv /var/lib/libvirt/images/*.qcow2 <new-path>/` + `virsh pool-refresh default` if needed."
+                                    font.family: Style.font.family
+                                    font.pixelSize: Style.font.caption - 1
+                                    color: Color.muted
+                                    wrapMode: Text.Wrap
+                                    opacity: 0.7
+                                }
                                 Label {
                                     visible: service && service.poolDetailText
                                     Layout.fillWidth: true
