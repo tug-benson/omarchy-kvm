@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+import re, subprocess, sys
+SAFE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+ACTIONS = {"start","shutdown","destroy","reboot","suspend","resume","autostart-on","autostart-off"}
+
+def run(cmd):
+    p=subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    return p.stdout, p.stderr, p.returncode
+
+def main():
+    if len(sys.argv)<3:
+        print("usage: omarchy-kvm-action <action> <vm>", file=sys.stderr); sys.exit(2)
+    action=sys.argv[1]
+    name=sys.argv[2]
+    if action not in ACTIONS:
+        print(f"invalid action {action}", file=sys.stderr); sys.exit(2)
+    if not SAFE_RE.match(name) or len(name)>100:
+        print("invalid name", file=sys.stderr); sys.exit(2)
+    uri="qemu:///system"
+    if action=="start":
+        cmd=["virsh","--connect",uri,"start",name]
+    elif action=="shutdown":
+        cmd=["virsh","--connect",uri,"shutdown",name]
+    elif action=="destroy":
+        cmd=["virsh","--connect",uri,"destroy",name]
+    elif action=="reboot":
+        cmd=["virsh","--connect",uri,"reboot",name]
+    elif action=="suspend":
+        cmd=["virsh","--connect",uri,"suspend",name]
+    elif action=="resume":
+        cmd=["virsh","--connect",uri,"resume",name]
+    elif action=="autostart-on":
+        cmd=["virsh","--connect",uri,"autostart",name]
+    elif action=="autostart-off":
+        cmd=["virsh","--connect",uri,"autostart","--disable",name]
+    out,err,code=run(cmd)
+    if code!=0:
+        print((err or out).strip(), file=sys.stderr)
+        sys.exit(code)
+    print(out.strip())
+
+if __name__=="__main__":
+    main()

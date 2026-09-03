@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""List libvirt domains as JSON via virsh."""
+import json, re, subprocess, sys
+
+SAFE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+MAX = 500
+
+def run(cmd):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    return p.stdout, p.stderr, p.returncode
+
+def parse_list():
+    out, err, code = run(["virsh", "--connect", "qemu:///system", "list", "--all", "--title"])
+    if code != 0:
+        # try without explicit connect (session) fallback
+        out2, err2, code2 = run(["virsh", "list", "--all", "--title"])
+        if code2 == 0:
+            out = out2
+            code = 0
+        else:
+            print(json.dumps({"error": (err or err2).strip()[:500]}))
+            sys.exit(0)
+    vms=[]
+    lines = out.strip().splitlines()
+    # skip header until --- line
+    start=False
+    for line in lines:
+        if not start:
+            if line.strip().startswith("---") or line.strip().startswith("----"):
+                start=True
+            continue
+        # format: Id   Name   State   Title
+        # Id may be '-' for shutoff
+        if not line.strip():
+            continue
+        # split by 2+ spaces or fixed columns: first cols Id, Name, State, rest Title
+        # Use regex: ^\s*(\S+)\s+(\S+)\s+(.+?)(?:\s{2,}(.*))?$
+        m = re.match(r"^\s*(\S+)\s+(\S+)\s+(.+?)(?:\s{2,}(.*))?$", line)
+        if not m:
+            continue
+        vid, name, state, title = m.groups()
+        title = title or ""
+        # state may be "running" or "shut off" etc — normalize
+        state = state.strip()
+        # if title was mistakenly part of state (when Title empty, there are only 3 cols)
+        # Virsh Title column is optional; if state contains extra, handle
+        # Actually for --title, Title is 4th column; if Title empty, line has only 3 cols
+        if title and title.strip() in ("", "-"):
+            title = ""
+        # Validate name
+        if not SAFE_RE.match(name):
+            continue
+        vms.append({"id": vid, "name": name, "state": state, "title": title.strip() if title else ""})
+        if len(vms) >= MAX:
+            break
+    # enrich with autostart/persistent via dominfo where possible (optional, best-effort)
+    enriched=[]
+    for vm in vms:
+        info_out, _, info_code = run(["virsh", "--connect", "qemu:///system", "dominfo", vm["name"]])
+        autostart = False
+        persistent = True
+        vcpu = 0
+        ram = 0
+        os_type = ""
+        if info_code == 0:
+            for l in info_out.splitlines():
+                if ":" not in l:
+                    continue
+                k,v = l.split(":",1)
+                k=k.strip(); v=v.strip()
+                if k=="Autostart": autostart = (v=="enable")
+                elif k=="Persistent": persistent = (v=="yes")
+                elif k=="CPU(s)":
+                    try: vcpu=int(v)
+                    except: pass
+                elif k=="Max memory":
+                    # e.g. 2097152 KiB
+                    try: ram=int(v.split()[0])
+                    except: pass
+                elif k=="OS Type":
+                    os_type=v
+        # snapshot count
+        snap_out, _, snap_code = run(["virsh", "--connect", "qemu:///system", "snapshot-list", vm["name"]])
+        snap_count=0
+        if snap_code==0:
+            for l in snap_out.splitlines():
+                if re.match(r"^\s*\S+\s+.*\d{4}-\d{2}-\d{2}", l):
+                    snap_count+=1
+                elif l.strip() and not l.strip().startswith("Name") and not l.strip().startswith("---"):
+                    # fallback count non-header lines with name
+                    pass
+            # simpler: count lines after header
+            lines2=[x for x in snap_out.splitlines() if x.strip() and not x.strip().startswith("Name") and not x.strip().startswith("---")]
+            snap_count=len(lines2)
+        enriched.append({**vm, "autostart": autostart, "persistent": persistent, "vcpu": vcpu, "ramKiB": ram, "osType": os_type, "snapshots": snap_count})
+    print(json.dumps(enriched))
+
+if __name__=="__main__":
+    parse_list()

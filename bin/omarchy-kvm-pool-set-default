@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+Change default storage pool location (xmodulo method).
+Handles both creating a new pool at custom path and redefining the default pool's <path>.
+Supports home directory paths with proper permission handling for libvirt-qemu.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+SAFE_PATH_RE = re.compile(r"^[a-zA-Z0-9._/\-]+$")
+
+def run(cmd, timeout=15):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return p.stdout, p.stderr, p.returncode
+
+def ensure_dir_accessible(path):
+    """Ensure directory exists and is accessible by libvirt-qemu (o+x on parents, o+r on dir)."""
+    try:
+        # Create directory if not exists
+        os.makedirs(path, exist_ok=True)
+        # Set permissions to 755 (rwxr-xr-x) so qemu can traverse
+        # For home paths, we need to ensure parent dirs are also accessible
+        # Don't change home itself too permissively, but ensure o+x
+        cur = os.path.abspath(path)
+        for _ in range(6):
+            if not cur or cur == "/" or cur == "/home":
+                break
+            try:
+                st = os.stat(cur)
+                # Ensure o+x (1) and o+r (4) for dirs
+                mode = st.st_mode
+                # Add o+x if missing
+                if not (mode & 0o001):
+                    try:
+                        os.chmod(cur, mode | 0o711)
+                    except:
+                        pass
+                # For the target dir itself, ensure 755
+                if cur == os.path.abspath(path):
+                    if not (mode & 0o005 == 0o005):  # check o+rx
+                        try:
+                            os.chmod(cur, 0o755)
+                        except:
+                            pass
+            except:
+                pass
+            cur = os.path.dirname(cur)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def get_pool_path(pool_name="default"):
+    """Get current pool path via dumpxml."""
+    out, err, code = run(["virsh", "--connect", "qemu:///system", "pool-dumpxml", pool_name])
+    if code != 0:
+        return None, err.strip()
+    # Parse <path> element
+    m = re.search(r"<path>(.*?)</path>", out)
+    if m:
+        return m.group(1).strip(), ""
+    return None, "path not found in XML"
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: omarchy-kvm-pool-set-default <new_path> [--pool <name>] [--mode create|redefine]", file=sys.stderr)
+        print("  <new_path>: absolute path for VM images (e.g., /home/user/VMs or /mnt/data/libvirt)", file=sys.stderr)
+        print("  --pool: pool name (default: default)", file=sys.stderr)
+        print("  --mode: create = create new pool (keeps old), redefine = move default pool (xmodulo method)", file=sys.stderr)
+        sys.exit(2)
+
+    new_path = sys.argv[1]
+    pool_name = "default"
+    mode = "redefine"  # default: move default pool
+
+    # Parse args
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == "--pool" and i+1 < len(sys.argv):
+            pool_name = sys.argv[i+1]
+            i += 2
+        elif sys.argv[i] == "--mode" and i+1 < len(sys.argv):
+            mode = sys.argv[i+1]
+            i += 2
+        else:
+            i += 1
+
+    # Validate path
+    if not os.path.isabs(new_path):
+        print(f"Path must be absolute: {new_path}", file=sys.stderr)
+        sys.exit(2)
+    if not SAFE_NAME_RE.match(pool_name):
+        print(f"Invalid pool name: {pool_name}", file=sys.stderr)
+        sys.exit(2)
+    # Basic path validation (allow home paths)
+    if len(new_path) > 512:
+        print("Path too long", file=sys.stderr)
+        sys.exit(2)
+
+    # Check if pool exists
+    out, err, code = run(["virsh", "--connect", "qemu:///system", "pool-info", pool_name])
+    pool_exists = (code == 0)
+
+    # Ensure directory exists and is accessible
+    ok, msg = ensure_dir_accessible(new_path)
+    if not ok:
+        print(f"Failed to create/access directory {new_path}: {msg}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Directory {new_path} ensured accessible", flush=True)
+
+    if mode == "create" and pool_exists:
+        print(f"Pool {pool_name} already exists, use --mode redefine to move it, or choose a different --pool name", file=sys.stderr)
+        sys.exit(1)
+
+    if mode == "redefine" and pool_exists:
+        # Xmodulo method: dumpxml, edit path, destroy, define
+        print(f"Redefining pool {pool_name} to {new_path} (xmodulo method)...", flush=True)
+        # Dump XML
+        out, err, code = run(["virsh", "--connect", "qemu:///system", "pool-dumpxml", pool_name])
+        if code != 0:
+            print(f"Failed to dumpxml {pool_name}: {err}", file=sys.stderr)
+            sys.exit(1)
+
+        # Edit <path> element
+        new_xml = re.sub(r"<path>.*?</path>", f"<path>{new_path}</path>", out, count=1)
+        if new_xml == out:
+            print("Failed to update <path> in XML (not found)", file=sys.stderr)
+            sys.exit(1)
+
+        # Check if pool is active, destroy if needed
+        is_active = False
+        info_out, _, _ = run(["virsh", "--connect", "qemu:///system", "pool-info", pool_name])
+        if "State:                   running" in info_out or "Active:                  yes" in info_out or "active" in info_out.lower():
+            # Try to destroy
+            print(f"Destroying active pool {pool_name}...", flush=True)
+            out2, err2, code2 = run(["virsh", "--connect", "qemu:///system", "pool-destroy", pool_name])
+            if code2 != 0:
+                print(f"Warning: pool-destroy failed: {err2} (may already be inactive)", file=sys.stderr)
+            else:
+                print(f"Pool {pool_name} destroyed", flush=True)
+                is_active = True
+
+        # Undefine old pool
+        print(f"Undefining pool {pool_name}...", flush=True)
+        out3, err3, code3 = run(["virsh", "--connect", "qemu:///system", "pool-undefine", pool_name])
+        if code3 != 0:
+            print(f"pool-undefine failed: {err3}", file=sys.stderr)
+            # Try to continue anyway
+
+        # Define new pool from edited XML via temp file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False, dir='/tmp') as f:
+            f.write(new_xml)
+            tmp_xml = f.name
+
+        try:
+            print(f"Defining new pool {pool_name} at {new_path}...", flush=True)
+            out4, err4, code4 = run(["virsh", "--connect", "qemu:///system", "pool-define", tmp_xml])
+            if code4 != 0:
+                print(f"pool-define failed: {err4}", file=sys.stderr)
+                # Try pool-define-as as fallback
+                print("Trying pool-define-as fallback...", flush=True)
+                out4b, err4b, code4b = run(["virsh", "--connect", "qemu:///system", "pool-define-as", pool_name, "dir", "--target", new_path])
+                if code4b != 0:
+                    print(f"Fallback also failed: {err4b}", file=sys.stderr)
+                    sys.exit(1)
+                else:
+                    print(f"Pool {pool_name} defined via fallback", flush=True)
+            else:
+                print(f"Pool {pool_name} redefined", flush=True)
+
+            # Build, start, autostart
+            print(f"Building pool {pool_name}...", flush=True)
+            out5, err5, code5 = run(["virsh", "--connect", "qemu:///system", "pool-build", pool_name])
+            if code5 != 0 and "already exists" not in err5 and "code=9" not in err5:
+                print(f"pool-build: {err5} (may be ok if dir exists)", file=sys.stderr)
+            else:
+                print(f"Pool {pool_name} built", flush=True)
+
+            print(f"Starting pool {pool_name}...", flush=True)
+            out6, err6, code6 = run(["virsh", "--connect", "qemu:///system", "pool-start", pool_name])
+            if code6 != 0:
+                print(f"pool-start failed: {err6}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Pool {pool_name} started", flush=True)
+
+            print(f"Enabling autostart for {pool_name}...", flush=True)
+            out7, err7, code7 = run(["virsh", "--connect", "qemu:///system", "pool-autostart", pool_name])
+            if code7 != 0:
+                print(f"pool-autostart failed: {err7}", file=sys.stderr)
+            else:
+                print(f"Pool {pool_name} autostart enabled", flush=True)
+
+            print(f"✓ Pool {pool_name} successfully moved to {new_path}", flush=True)
+            # Verify
+            new_path_check, _ = get_pool_path(pool_name)
+            if new_path_check == new_path:
+                print(f"Verified: {pool_name} now at {new_path}", flush=True)
+            else:
+                print(f"Warning: verification failed, pool at {new_path_check} != {new_path}", file=sys.stderr)
+
+        finally:
+            try:
+                os.unlink(tmp_xml)
+            except:
+                pass
+
+    else:
+        # Create new pool (mode create or pool doesn't exist)
+        print(f"Creating new pool {pool_name} at {new_path}...", flush=True)
+        out, err, code = run(["virsh", "--connect", "qemu:///system", "pool-define-as", pool_name, "dir", "--target", new_path])
+        if code != 0:
+            print(f"pool-define-as failed: {err}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Pool {pool_name} defined", flush=True)
+
+        out2, err2, code2 = run(["virsh", "--connect", "qemu:///system", "pool-build", pool_name])
+        if code2 != 0 and "already exists" not in err2:
+            print(f"pool-build: {err2}", file=sys.stderr)
+
+        out3, err3, code3 = run(["virsh", "--connect", "qemu:///system", "pool-start", pool_name])
+        if code3 != 0:
+            print(f"pool-start failed: {err3}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Pool {pool_name} started", flush=True)
+
+        out4, err4, code4 = run(["virsh", "--connect", "qemu:///system", "pool-autostart", pool_name])
+        if code4 != 0:
+            print(f"pool-autostart failed: {err4}", file=sys.stderr)
+        else:
+            print(f"Pool {pool_name} autostart enabled", flush=True)
+
+        print(f"✓ Pool {pool_name} created at {new_path}", flush=True)
+
+if __name__ == "__main__":
+    main()

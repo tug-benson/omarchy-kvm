@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+import re, subprocess, sys
+SAFE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+def run(cmd):
+    p=subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+    return p.stdout,p.stderr,p.returncode
+def main():
+    if len(sys.argv)<4:
+        print("usage: omarchy-kvm-hardware <set-vcpus|set-memory> <vm> <value> [--live]", file=sys.stderr); sys.exit(2)
+    op=sys.argv[1]; vm=sys.argv[2]; val=sys.argv[3]; live="--live" in sys.argv
+    if not SAFE_RE.match(vm) or len(vm)>100:
+        print("invalid vm", file=sys.stderr); sys.exit(2)
+    uri="qemu:///system"
+    if op=="set-vcpus":
+        try: cnt=int(val); assert 1 <= cnt <= 64
+        except: print("invalid vcpus 1-64", file=sys.stderr); sys.exit(2)
+        # check state: if running and not live, need shutdown
+        flags = ["--live","--config"] if live else ["--config"]
+        # virsh setvcpus
+        cmd=["virsh","--connect",uri,"setvcpus",vm,str(cnt)]+flags
+        out,err,code=run(cmd)
+        if code!=0:
+            print((err or out).strip(), file=sys.stderr); sys.exit(code)
+        print(out.strip() or "vcpus set")
+    elif op=="set-memory":
+        try: mem=int(val); assert 256 <= mem <= 65536
+        except: print("invalid memory 256-65536", file=sys.stderr); sys.exit(2)
+        flags = ["--live","--config"] if live else ["--config"]
+        # virsh setmem is deprecated, use setmaxmem + setmem
+        out,err,code=run(["virsh","--connect",uri,"setmaxmem",vm,f"{mem}M"]+flags)
+        if code!=0:
+            # try setmem fallback
+            out2,err2,code2=run(["virsh","--connect",uri,"setmem",vm,f"{mem}M"]+flags)
+            if code2!=0:
+                print((err or err2).strip(), file=sys.stderr); sys.exit(code2)
+        # also setmem for live
+        if live:
+            run(["virsh","--connect",uri,"setmem",vm,f"{mem}M","--live"])
+        print("memory set")
+    else:
+        print("unknown op", file=sys.stderr); sys.exit(2)
+
+if __name__=="__main__":
+    main()

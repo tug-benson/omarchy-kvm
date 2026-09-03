@@ -1,0 +1,15 @@
+# user settings (local only)
+.settings.json
+*.qcow2
+*.xml
+*.log
+__pycache__/
+*.pyc
+# homelab / personal
+.env
+*.ovf
+# omarchy symlink
+plugins/
+# source reference — not for publish
+ressource/
+ressource.txt

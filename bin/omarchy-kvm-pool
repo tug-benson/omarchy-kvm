@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import subprocess, sys, json
+def run(cmd):
+    p=subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    return p.stdout,p.stderr,p.returncode
+def main():
+    op=sys.argv[1] if len(sys.argv)>1 else "list"
+    uri="qemu:///system"
+    if op=="list":
+        out,err,code=run(["virsh","--connect",uri,"pool-list","--all"])
+        print(out if code==0 else err); sys.exit(0 if code==0 else code)
+    elif op=="info":
+        name=sys.argv[2] if len(sys.argv)>2 else "default"
+        out,err,code=run(["virsh","--connect",uri,"pool-info",name])
+        print(out if code==0 else err); sys.exit(0 if code==0 else code)
+    elif op=="vol-list":
+        pool=sys.argv[2] if len(sys.argv)>2 else "default"
+        out,err,code=run(["virsh","--connect",uri,"vol-list","--pool",pool])
+        print(out if code==0 else err); sys.exit(0 if code==0 else code)
+    elif op=="create":
+        # create dir pool: name path
+        if len(sys.argv)<4: print("usage: pool create <name> <path>", file=sys.stderr); sys.exit(2)
+        name=sys.argv[2]; path=sys.argv[3]
+        xml=f"<pool type='dir'><name>{name}</name><target><path>{path}</path></target></pool>"
+        out,err,code=run(["virsh","--connect",uri,"pool-define-as",name,"dir","--target",path])
+        if code!=0:
+            # fallback via define xml
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
+                f.write(xml); fname=f.name
+            out,err,code=run(["virsh","--connect",uri,"pool-define",fname])
+            os.unlink(fname)
+        if code==0:
+            run(["virsh","--connect",uri,"pool-build",name])
+            run(["virsh","--connect",uri,"pool-start",name])
+            run(["virsh","--connect",uri,"pool-autostart",name])
+        print(out if code==0 else err); sys.exit(0 if code==0 else code)
+    elif op in ("start","stop","delete"):
+        name=sys.argv[2] if len(sys.argv)>2 else "default"
+        cmd={"start":"pool-start","stop":"pool-destroy","delete":"pool-undefine"}[op]
+        out,err,code=run(["virsh","--connect",uri,cmd,name])
+        print(out if code==0 else err); sys.exit(0 if code==0 else code)
+    else:
+        print("unknown op", file=sys.stderr); sys.exit(2)
+
+if __name__=="__main__":
+    main()

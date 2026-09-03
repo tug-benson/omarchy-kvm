@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+import subprocess, sys, json, shutil, os
+def run(cmd):
+    p=subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return p.stdout,p.stderr,p.returncode
+
+def main():
+    if len(sys.argv)<2:
+        print("usage: omarchy-kvm-create <jsonParamsFile>", file=sys.stderr); sys.exit(2)
+    params_file=sys.argv[1]
+    import json as js
+    try:
+        with open(params_file) as f:
+            p=js.load(f)
+    except Exception as e:
+        print(f"invalid json: {e}", file=sys.stderr); sys.exit(2)
+    name=p.get("name","")
+    mem=p.get("memoryMb",2048)
+    vcpus=p.get("vcpus",2)
+    disk=p.get("diskSizeGb",20)
+    pool=p.get("poolName","default")
+    osvar=p.get("osVariant","generic")
+    iso=p.get("isoPath","")
+    net=p.get("networkName","default")
+    firmware=p.get("bootFirmware","bios")
+    graphics=p.get("graphicsType","spice")
+    if not name:
+        print("name required", file=sys.stderr); sys.exit(2)
+    if not shutil.which("virt-install"):
+        print("virt-install not found — install virtinst", file=sys.stderr); sys.exit(3)
+    args=["virt-install","--connect","qemu:///system","--name",name,"--memory",str(mem),"--vcpus",str(vcpus),"--disk",f"size={disk},format=qcow2,pool={pool}","--os-variant",osvar,"--network",f"network={net},model=virtio","--graphics",graphics,"--noautoconsole"]
+    # ── ISO permission fix (qemu user needs o+r + o+x on parents) ──
+    effectiveIso = iso
+    if iso:
+        if not os.path.exists(iso):
+            print(f"ISO not found: {iso}", file=sys.stderr); sys.exit(2)
+        # try to make readable
+        try:
+            st = os.stat(iso)
+            # fix file perms if not world-readable
+            if not (st.st_mode & 0o004):
+                try: os.chmod(iso, st.st_mode | 0o644)
+                except: pass
+            # fix parent dirs x
+            cur = os.path.dirname(os.path.abspath(iso))
+            for _ in range(6):  # up to 6 levels (home + subdirs)
+                if not cur or cur == "/" or cur == "/home": break
+                try:
+                    pst = os.stat(cur)
+                    if not (pst.st_mode & 0o001):
+                        try: os.chmod(cur, pst.st_mode | 0o711)
+                        except: pass
+                except: pass
+                cur = os.path.dirname(cur)
+            # verify still not readable by qemu? try to copy to pool if needed
+            st2 = os.stat(iso)
+            if not (st2.st_mode & 0o004):
+                # fallback: copy to /var/lib/libvirt/images (needs sudo or group)
+                basename = os.path.basename(iso)
+                dest = f"/var/lib/libvirt/images/{basename}"
+                try:
+                    if not os.path.exists(dest):
+                        # try normal copy first
+                        try:
+                            shutil.copy(iso, dest)
+                            os.chmod(dest, 0o644)
+                            effectiveIso = dest
+                            print(f"ISO copied to {dest} for libvirt access", flush=True)
+                        except PermissionError:
+                            # try sudo copy
+                            cp = subprocess.run(["sudo", "cp", iso, dest], capture_output=True, text=True, timeout=30)
+                            if cp.returncode == 0:
+                                subprocess.run(["sudo", "chmod", "644", dest], timeout=5)
+                                effectiveIso = dest
+                                print(f"ISO copied via sudo to {dest}", flush=True)
+                            else:
+                                print(f"Warning: ISO not world-readable, qemu may fail. Try: sudo chmod o+r \"{iso}\" && sudo chmod o+x \"{os.path.dirname(iso)}\"", file=sys.stderr, flush=True)
+                    else:
+                        effectiveIso = dest
+                except Exception as e:
+                    print(f"Warning: could not ensure ISO access: {e}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"Warning: ISO permission check failed: {e}", file=sys.stderr, flush=True)
+        args+=["--cdrom",effectiveIso]
+    else:
+        args+=["--import"]
+    if firmware=="uefi":
+        args+=["--boot","uefi"]
+    # run
+    proc=subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        print(line, end='', flush=True)
+    proc.wait()
+    sys.exit(proc.returncode)
+
+if __name__=="__main__":
+    main()

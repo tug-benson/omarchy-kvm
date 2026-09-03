@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Dom info/detail for one VM."""
+import json, re, subprocess, sys
+
+SAFE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+def run(cmd):
+    p=subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    return p.stdout, p.stderr, p.returncode
+
+def main():
+    if len(sys.argv)<2:
+        print(json.dumps({"error":"name required"})); sys.exit(1)
+    name=sys.argv[1]
+    if not SAFE_RE.match(name) or len(name)>100:
+        print(json.dumps({"error":"invalid name"})); sys.exit(1)
+    out, err, code = run(["virsh","--connect","qemu:///system","dominfo",name])
+    if code!=0:
+        print(json.dumps({"error": err.strip()[:500] or "dominfo failed"})); sys.exit(0)
+    info={}
+    for l in out.splitlines():
+        if ":" not in l: continue
+        k,v=l.split(":",1)
+        info[k.strip()]=v.strip()
+    # domifaddr
+    if_out, _, _ = run(["virsh","--connect","qemu:///system","domifaddr",name,"--source","lease"])
+    if not if_out.strip():
+        if_out, _, _ = run(["virsh","--connect","qemu:///system","domifaddr",name])
+    ips=[]
+    for l in if_out.splitlines():
+        # parse ipv4
+        m=re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", l)
+        if m: ips.append(m.group(1))
+    # dumpxml for firmware/tpm
+    xml_out, _, xml_code = run(["virsh","--connect","qemu:///system","dumpxml",name])
+    firmware="bios"
+    tpm=False
+    if xml_code==0:
+        if "OVMF" in xml_out or "edk2" in xml_out.lower() or "<loader" in xml_out:
+            firmware="uefi"
+        if "<tpm" in xml_out:
+            tpm=True
+    print(json.dumps({"name":name, "info":info, "ips":ips, "firmware":firmware, "tpm":tpm}))
+
+if __name__=="__main__":
+    main()

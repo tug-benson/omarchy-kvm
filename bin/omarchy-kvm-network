@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+import subprocess, sys, json
+def run(cmd):
+    p=subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    return p.stdout,p.stderr,p.returncode
+
+def main():
+    op=sys.argv[1] if len(sys.argv)>1 else "list"
+    if op=="list":
+        out,err,code=run(["virsh","--connect","qemu:///system","net-list","--all"])
+        if code!=0:
+            # fallback without connect
+            out,err,code=run(["virsh","net-list","--all"])
+        print(out if code==0 else err)
+        sys.exit(0 if code==0 else code)
+    elif op=="info":
+        name=sys.argv[2] if len(sys.argv)>2 else "default"
+        out,err,code=run(["virsh","--connect","qemu:///system","net-info",name])
+        print(out if code==0 else err)
+        sys.exit(0 if code==0 else code)
+    elif op=="start":
+        name=sys.argv[2] if len(sys.argv)>2 else "default"
+        out,err,code=run(["virsh","--connect","qemu:///system","net-start",name])
+        print(out if code==0 else err)
+        sys.exit(0 if code==0 else code)
+    elif op=="stop" or op=="destroy":
+        name=sys.argv[2] if len(sys.argv)>2 else "default"
+        out,err,code=run(["virsh","--connect","qemu:///system","net-destroy",name])
+        print(out if code==0 else err)
+        sys.exit(0 if code==0 else code)
+    elif op=="autostart":
+        name=sys.argv[2] if len(sys.argv)>2 else "default"
+        flag=sys.argv[3] if len(sys.argv)>3 else "yes"
+        if flag=="no":
+            out,err,code=run(["virsh","--connect","qemu:///system","net-autostart","--disable",name])
+        else:
+            out,err,code=run(["virsh","--connect","qemu:///system","net-autostart",name])
+        print(out if code==0 else err)
+        sys.exit(0 if code==0 else code)
+    else:
+        print("unknown", file=sys.stderr); sys.exit(2)
+
+if __name__=="__main__":
+    main()
