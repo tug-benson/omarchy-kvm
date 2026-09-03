@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+Manage VM network interfaces (NAT vs Bridge) per https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/
+Supports: list host bridges, list libvirt networks, attach/detach/change interface for a VM.
+"""
+import re
+import subprocess
+import sys
+import os
+
+def run(cmd, timeout=10):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return p.stdout, p.stderr, p.returncode
+
+def list_host_bridges():
+    """List host bridges via ip link and nmcli."""
+    bridges = []
+    # Get bridges via ip link
+    out, _, _ = run(["ip", "-o", "link", "show", "type", "bridge"])
+    for line in out.splitlines():
+        # e.g., "11: virbr0: <BROADCAST,MULTICAST,UP,LOWER_UP> ..."
+        m = re.search(r"\d+: (\w+):", line)
+        if m:
+            bridges.append(m.group(1))
+    # Also check for br0 via nmcli or ip
+    out2, _, _ = run(["ip", "link", "show"])
+    for line in out2.splitlines():
+        if "br0:" in line:
+            if "br0" not in bridges:
+                bridges.append("br0")
+    # Check via virsh iface-list
+    out3, _, _ = run(["virsh", "--connect", "qemu:///system", "iface-list", "--all"])
+    for line in out3.splitlines():
+        parts = line.split()
+        if len(parts) >= 1 and parts[0] not in ["Name", "----------------------------------------"]:
+            iface = parts[0]
+            if iface.startswith("br") and iface not in bridges:
+                bridges.append(iface)
+    return sorted(set(bridges))
+
+def list_libvirt_networks():
+    """List libvirt networks via virsh net-list."""
+    networks = []
+    out, _, _ = run(["virsh", "--connect", "qemu:///system", "net-list", "--all"])
+    lines = out.splitlines()
+    start = False
+    for line in lines:
+        line = line.strip()
+        if not start:
+            if line.startswith("---"):
+                start = True
+            continue
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 1:
+            networks.append(parts[0])
+    return sorted(set(networks))
+
+def get_vm_interface(vm):
+    """Get current VM interface via dumpxml."""
+    out, err, code = run(["virsh", "--connect", "qemu:///system", "dumpxml", vm])
+    if code != 0:
+        return None, err
+    # Find <interface> block
+    # Look for <interface type='network'> with <source network='...'/> or <interface type='bridge'> with <source bridge='...'/>
+    # Use regex to find first interface
+    m = re.search(r"<interface\s+type='([^']+)'[^>]*>.*?<source\s+(network|bridge)='([^']+)'", out, re.DOTALL)
+    if m:
+        iftype, srctype, source = m.groups()
+        # Also get model and mac
+        mac_m = re.search(r"<mac\s+address='([^']+)'", out)
+        mac = mac_m.group(1) if mac_m else ""
+        model_m = re.search(r"<model\s+type='([^']+)'", out)
+        model = model_m.group(1) if model_m else "virtio"
+        return {"type": iftype, "source_type": srctype, "source": source, "mac": mac, "model": model}, ""
+    return None, "No interface found"
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: omarchy-kvm-net-attach <list-host-bridges|list-libvirt-networks|get <vm>|set <vm> <network|bridge> <source> [--model virtio] [--live]", file=sys.stderr)
+        sys.exit(2)
+    cmd = sys.argv[1]
+    if cmd == "list-host-bridges":
+        bridges = list_host_bridges()
+        for b in bridges:
+            print(b)
+    elif cmd == "list-libvirt-networks":
+        nets = list_libvirt_networks()
+        for n in nets:
+            print(n)
+    elif cmd == "list-all":
+        # For UI: list both
+        bridges = list_host_bridges()
+        nets = list_libvirt_networks()
+        print("HOST_BRIDGES:" + ",".join(bridges))
+        print("LIBVIRT_NETWORKS:" + ",".join(nets))
+        # Also list current VM interfaces if vm provided
+    elif cmd == "get":
+        if len(sys.argv) < 3:
+            print("usage: get <vm>", file=sys.stderr)
+            sys.exit(2)
+        vm = sys.argv[2]
+        info, err = get_vm_interface(vm)
+        if info is None:
+            print(f"Error: {err}", file=sys.stderr)
+            sys.exit(1)
+        # Output as JSON-like for parsing
+        print(f"type={info['type']}")
+        print(f"source_type={info['source_type']}")
+        print(f"source={info['source']}")
+        print(f"mac={info['mac']}")
+        print(f"model={info['model']}")
+    elif cmd == "set":
+        if len(sys.argv) < 5:
+            print("usage: set <vm> <network|bridge> <source> [--model virtio] [--live]", file=sys.stderr)
+            sys.exit(2)
+        vm = sys.argv[2]
+        src_type = sys.argv[3]  # "network" or "bridge"
+        source = sys.argv[4]
+        model = "virtio"
+        live = False
+        for i in range(5, len(sys.argv)):
+            if sys.argv[i] == "--model" and i+1 < len(sys.argv):
+                model = sys.argv[i+1]
+            if sys.argv[i] == "--live":
+                live = True
+        if src_type not in ["network", "bridge"]:
+            print("src_type must be network or bridge", file=sys.stderr)
+            sys.exit(2)
+        # Check VM exists and get current interface to detach
+        info, err = get_vm_interface(vm)
+        if info is None:
+            print(f"Error getting current interface: {err}", file=sys.stderr)
+            sys.exit(1)
+        # Check if VM is running
+        out, _, _ = run(["virsh", "--connect", "qemu:///system", "dominfo", vm])
+        is_running = "running" in out.lower()
+        # Detach old interface
+        # Use virsh detach-interface
+        # First, try to detach the current interface
+        # For detach, we need to know the type and source, but detach-interface can work with --type and --source
+        # Let's try: virsh detach-interface <vm> --type <type> --source <source> [--live|--config]
+        # If that fails, try to use virsh update-device with edited XML
+        print(f"Detaching old interface {info['type']}:{info['source']} from {vm}...", flush=True)
+        detach_cmd = ["virsh", "--connect", "qemu:///system", "detach-interface", vm, info['type'], "--source", info['source']]
+        if is_running and live:
+            detach_cmd.append("--live")
+        else:
+            detach_cmd.append("--config")
+            if is_running:
+                print("VM is running, will need restart for change to take effect (use --live for hotplug if supported)", file=sys.stderr)
+        out, err, code = run(detach_cmd)
+        if code != 0:
+            # Try without --config/--live, just detach
+            print(f"detach-interface with config/live failed: {err}, trying without...", file=sys.stderr)
+            out, err, code = run(["virsh", "--connect", "qemu:///system", "detach-interface", vm, info['type'], "--source", info['source']])
+            if code != 0:
+                print(f"Failed to detach old interface: {err}", file=sys.stderr)
+                # Try alternative: use virsh dumpxml, edit, define (requires VM shutoff)
+                if is_running:
+                    print("VM is running, cannot use define method. Please shut down VM first.", file=sys.stderr)
+                    sys.exit(1)
+                # For shutoff, we can edit XML directly
+                print("Trying XML edit method...", flush=True)
+                out_xml, _, _ = run(["virsh", "--connect", "qemu:///system", "dumpxml", vm])
+                # Replace the interface source
+                # Find the interface block and replace source
+                # Simple replace: <source network='old'/> or <source bridge='old'/>
+                old_pattern = f"<source {info['source_type']}='{re.escape(info['source'])}'"
+                # Use regex to replace
+                new_source = f"<source {src_type}='{source}'"
+                new_xml = re.sub(rf"<source\s+{info['source_type']}=['\"]{re.escape(info['source'])}['\"]", new_source, out_xml, count=1)
+                if new_xml == out_xml:
+                    # Try more generic
+                    new_xml = re.sub(rf"<source\s+{re.escape(info['source_type'])}\s*=\s*['\"]{re.escape(info['source'])}['\"]", new_source, out_xml, count=1)
+                if new_xml == out_xml:
+                    print("Failed to patch XML", file=sys.stderr)
+                    sys.exit(1)
+                # Also update type if needed
+                if info['type'] != src_type and src_type == "bridge":
+                    # Change <interface type='network'> to <interface type='bridge'>
+                    new_xml = new_xml.replace(f"<interface type='{info['type']}'", f"<interface type='{src_type}'", 1)
+                import tempfile, os
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False, dir='/tmp') as f:
+                    f.write(new_xml)
+                    tmp = f.name
+                out2, err2, code2 = run(["virsh", "--connect", "qemu:///system", "define", tmp])
+                os.unlink(tmp)
+                if code2 != 0:
+                    print(f"define failed: {err2}", file=sys.stderr)
+                    sys.exit(1)
+                print(f"✓ VM {vm} interface updated via define: {info['source']} -> {source} ({src_type})", flush=True)
+                sys.exit(0)
+        else:
+            print(f"Old interface detached", flush=True)
+
+        # Now attach new interface
+        print(f"Attaching new interface {src_type}:{source} to {vm}...", flush=True)
+        attach_cmd = ["virsh", "--connect", "qemu:///system", "attach-interface", vm, src_type, "--source", source, "--model", model, "--persistent"]
+        if is_running and live:
+            attach_cmd.append("--live")
+        # For bridge, need to specify --type bridge, for network --type network
+        # virsh attach-interface syntax: attach-interface <domain> <type> <source> [--target ...] [--mac ...] [--model ...] [--live] [--config] [--persistent]
+        # We already have type and source, need to ensure correct order
+        # Actually virsh attach-interface <domain> <type> <source> --model virtio
+        # For bridge: type is "bridge", source is "br0"
+        # For network: type is "network", source is "default"
+        out, err, code = run(attach_cmd)
+        if code != 0:
+            print(f"attach-interface failed: {err}", file=sys.stderr)
+            # Try with --config if live failed
+            if live:
+                print("Trying with --config...", flush=True)
+                attach_cmd2 = ["virsh", "--connect", "qemu:///system", "attach-interface", vm, src_type, "--source", source, "--model", model, "--config"]
+                out, err, code = run(attach_cmd2)
+                if code != 0:
+                    print(f"Still failed: {err}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                sys.exit(1)
+        print(f"✓ VM {vm} new interface attached: {src_type}:{source} ({model})", flush=True)
+        # Verify
+        info2, _ = get_vm_interface(vm)
+        if info2:
+            print(f"Verified: {info2['type']}:{info2['source']} ({info2['model']})", flush=True)
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()

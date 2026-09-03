@@ -462,6 +462,93 @@ Item {
     }
     function refreshPoolPath() { poolPathProc.command = ["virsh", "--connect", "qemu:///system", "pool-dumpxml", "default"]; poolPathProc.running = true }
 
+    // ── VM Network (NAT vs Bridge) ── per blog.stephane-robert.info
+    property string vmNetInfo: ""
+    property string vmNetSource: ""
+    property string vmNetType: ""
+    property var hostBridges: []
+    property var libvirtNetworks: []
+    Process {
+        id: vmNetInfoProc
+        stdout: StdioCollector { id: vmNetInfoOut; waitForEnd: true }
+        stderr: StdioCollector { id: vmNetInfoErr; waitForEnd: true }
+        onExited: function(code) {
+            if (code === 0) {
+                var txt = vmNetInfoOut.text
+                // Parse "type=network\nsource_type=network\nsource=default..."
+                var mType = txt.match(/type=([^\n]+)/)
+                var mSrcType = txt.match(/source_type=([^\n]+)/)
+                var mSrc = txt.match(/source=([^\n]+)/)
+                if (mType) root.vmNetType = mType[1].trim()
+                if (mSrcType) root.vmNetSource = mSrc ? mSrc[1].trim() : ""
+                else if (mSrc) root.vmNetSource = mSrc[1].trim()
+                root.vmNetInfo = txt.trim().substring(0,500)
+            } else {
+                root.vmNetInfo = vmNetInfoErr.text.trim().substring(0,300)
+            }
+        }
+    }
+    function fetchVmNet(vm) {
+        if (!vm) return
+        vmNetInfoProc.command = ["python3", root.scriptPath("omarchy-kvm-net-attach"), "get", vm]
+        vmNetInfoProc.running = true
+    }
+    Process {
+        id: hostNetProc
+        stdout: StdioCollector { id: hostNetOut; waitForEnd: true }
+        stderr: StdioCollector { id: hostNetErr; waitForEnd: true }
+        onExited: function(code) {
+            if (code === 0) {
+                var txt = hostNetOut.text
+                // Parse "HOST_BRIDGES:br0,virbr0\nLIBVIRT_NETWORKS:default"
+                var m1 = txt.match(/HOST_BRIDGES:([^\n]*)/)
+                var m2 = txt.match(/LIBVIRT_NETWORKS:([^\n]*)/)
+                if (m1) {
+                    var b = m1[1].trim()
+                    root.hostBridges = b ? b.split(",").filter(function(x){return x}) : []
+                }
+                if (m2) {
+                    var n = m2[1].trim()
+                    root.libvirtNetworks = n ? n.split(",").filter(function(x){return x}) : []
+                }
+            }
+        }
+    }
+    function refreshHostNetworks() {
+        hostNetProc.command = ["python3", root.scriptPath("omarchy-kvm-net-attach"), "list-all"]
+        hostNetProc.running = true
+    }
+    Process {
+        id: vmNetSetProc
+        stdout: StdioCollector { id: vmNetSetOut; waitForEnd: true }
+        stderr: StdioCollector { id: vmNetSetErr; waitForEnd: true }
+        property bool timedOut: false
+        onRunningChanged: { if (running) { timedOut=false; vmNetSetDeadline.restart(); root.busy=true } else { vmNetSetDeadline.stop(); root.busy=false } }
+        onExited: function(code) {
+            vmNetSetDeadline.stop(); root.busy=false
+            if (timedOut) { root.lastError="network change timeout"; return }
+            var out = vmNetSetOut.text.trim()
+            var err = vmNetSetErr.text.trim()
+            if (code === 0) {
+                root.lastError=""; root.lastInfo=out.substring(0,400) || "Network updated"
+                // Refresh VM net info
+                if (root.lastDiskPath) {
+                    // Use lastDiskPath as vm name? No, need to store last vm
+                }
+            } else {
+                root.lastError=(err||out).substring(0,600)
+            }
+        }
+    }
+    Timer { id: vmNetSetDeadline; interval: 20000; onTriggered: { vmNetSetProc.timedOut=true; vmNetSetProc.running=false } }
+    function setVmNetwork(vm, srcType, source, live) {
+        if (!vm || !srcType || !source) { root.lastError="vm, type and source required"; return }
+        var cmd = ["python3", root.scriptPath("omarchy-kvm-net-attach"), "set", vm, srcType, source]
+        if (live) cmd.push("--live")
+        vmNetSetProc.command = cmd
+        vmNetSetProc.running = true
+    }
+
     Process {
         id: poolSetProc
         stdout: StdioCollector { id: poolSetOut; waitForEnd: true }

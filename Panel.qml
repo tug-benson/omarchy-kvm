@@ -486,7 +486,7 @@ Panel {
                                 Layout.fillWidth: true
                                 text: service && service.importBusy ? "⏳ Importing…" : "⬆ Import"
                                 fontSize: Style.font.caption
-                                enabled: !service.importBusy && root.importFile.length>0 && root.importVmName.length>0 && root.importPoolPath.length>0
+                                enabled: service && !service.importBusy && root.importFile.length>0 && root.importVmName.length>0 && root.importPoolPath.length>0
                                 onClicked: {
                                     if (service) service.importDisk({filePath: root.importFile, vmName: root.importVmName, memoryMb: root.importMem, vcpus: root.importVcpus, poolPath: root.importPoolPath, osVariant: root.importOsVariant, noCreate: root.importNoCreate})
                                 }
@@ -616,8 +616,14 @@ Panel {
                                             tooltipText: "Details"
                                             Layout.preferredWidth: Style.space(22)
                                             onClicked: {
-                                                root.expandedVm = row.expanded ? "" : row.vmName
-                                                if (!row.expanded && service) service.fetchStats(row.vmName)
+                                                var willExpand = !row.expanded
+                                                root.expandedVm = willExpand ? row.vmName : ""
+                                                if (willExpand && service) {
+                                                    service.fetchStats(row.vmName)
+                                                    service.fetchVmNet(row.vmName)
+                                                    service.refreshHostNetworks()
+                                                    service.fetchDiskPath(row.vmName)
+                                                }
                                             }
                                         }
                                     }
@@ -777,6 +783,89 @@ Panel {
                                                     font.pixelSize: Style.font.caption - 1
                                                     color: Color.urgent
                                                     wrapMode: Text.Wrap
+                                                }
+                                            }
+                                        }
+
+                                        // network interface (NAT vs Bridge) — per blog.stephane-robert.info
+                                        Rectangle {
+                                            Layout.fillWidth: true
+                                            radius: 4
+                                            color: Util.alpha(Color.foreground,0.04)
+                                            border.color: Util.alpha(Color.foreground,0.08)
+                                            border.width: 1
+                                            implicitHeight: netChoiceCol.implicitHeight + 8
+                                            ColumnLayout {
+                                                id: netChoiceCol
+                                                anchors.fill: parent
+                                                anchors.margins: 6
+                                                spacing: 4
+                                                Label {
+                                                    textFormat: Text.PlainText
+                                                    text: "Network"
+                                                    font.pixelSize: Style.font.caption
+                                                    font.bold: true
+                                                    color: Color.foreground
+                                                }
+                                                Label {
+                                                    Layout.fillWidth: true
+                                                    textFormat: Text.PlainText
+                                                    text: service ? (service.vmNetType + ":" + service.vmNetSource + " (" + (service.vmNetType === "bridge" ? "Bridge, LAN IP" : "NAT, virbr0 192.168.122.0/24") + ")") : "—"
+                                                    font.family: "JetBrainsMono Nerd Font"
+                                                    font.pixelSize: Style.font.caption - 1
+                                                    color: Color.muted
+                                                    wrapMode: Text.Wrap
+                                                    elide: Text.ElideMiddle
+                                                }
+                                                Label {
+                                                    Layout.fillWidth: true
+                                                    textFormat: Text.PlainText
+                                                    text: "NAT = private (192.168.122.x), Internet via host. Bridge = LAN IP, needs br0 (see blog.stephane-robert.info)"
+                                                    font.pixelSize: Style.font.caption - 1
+                                                    color: Color.muted
+                                                    wrapMode: Text.Wrap
+                                                    opacity: 0.6
+                                                }
+                                                RowLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: Style.space(4)
+                                                    Label { textFormat: Text.PlainText; text: "Type"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                                    Dropdown {
+                                                        id: netTypeDropdown
+                                                        Layout.preferredWidth: Style.space(90)
+                                                        value: service ? service.vmNetType : "network"
+                                                        options: ["network", "bridge"]
+                                                        showLabel: false
+                                                        onChanged: function(value){ if (service) service.vmNetType = value }
+                                                    }
+                                                    Label { textFormat: Text.PlainText; text: "Source"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                                    SearchableDropdown {
+                                                        Layout.fillWidth: true
+                                                        value: service ? service.vmNetSource : "default"
+                                                        options: netTypeDropdown.value === "bridge" ? (service ? (service.hostBridges.length ? service.hostBridges : ["br0", "virbr0", "enp5s0"]) : ["br0"]) : (service ? (service.libvirtNetworks.length ? service.libvirtNetworks : ["default"]) : ["default"])
+                                                        placeholderText: "Source…"
+                                                        onChanged: function(value){ if (service) service.vmNetSource = value }
+                                                    }
+                                                }
+                                                RowLayout {
+                                                    Layout.fillWidth: true
+                                                    spacing: Style.space(4)
+                                                    CheckBox { id: netLiveChk2; text: "Live"; checked: false; font.pixelSize: Style.font.caption }
+                                                    Button {
+                                                        text: "Apply Network"
+                                                        fontSize: Style.font.caption
+                                                        Layout.fillWidth: true
+                                                        enabled: service && !service.busy && service.vmNetSource
+                                                        onClicked: service.setVmNetwork(row.vmName, netTypeDropdown.value, service.vmNetSource, netLiveChk2.checked)
+                                                    }
+                                                    Button {
+                                                        iconText: ""
+                                                        fontFamily: "JetBrainsMono Nerd Font"
+                                                        fontSize: Style.font.caption
+                                                        tooltipText: "Refresh networks"
+                                                        Layout.preferredWidth: Style.space(28)
+                                                        onClicked: { service.fetchVmNet(row.vmName); service.refreshHostNetworks() }
+                                                    }
                                                 }
                                             }
                                         }
@@ -1152,7 +1241,7 @@ Panel {
                     Label {
                         Layout.fillWidth: true
                         textFormat: Text.PlainText
-                        text: "Tip: Hardware changes à froid si VM arrêtée, à chaud via Live toggle. Clonage via virt-clone."
+                        text: "Tip: Hardware changes need VM shutdown for cold apply, or use Live toggle for hot apply. Cloning via virt-clone."
                         font.family: Style.font.family; font.pixelSize: Style.font.caption - 1; color: Color.muted; opacity: 0.7; wrapMode: Text.Wrap
                     }
                 }
