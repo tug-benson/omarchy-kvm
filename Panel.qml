@@ -55,6 +55,15 @@ Panel {
     property string newPoolName: ""
     property string newDiskPath: ""
     property string diskPickerVm: ""
+    // Import OVA/VMDK
+    property bool showImport: false
+    property string importFile: ""
+    property string importVmName: ""
+    property int importMem: 2048
+    property int importVcpus: 2
+    property string importPoolPath: ""
+    property string importOsVariant: "generic"
+    property bool importNoCreate: false
 
     // zenity pickers (avoid native FileDialog crash in layer-shell)
     Process {
@@ -90,6 +99,25 @@ Panel {
             if (code === 0) {
                 var p = diskPickerOut.text.trim()
                 if (p) root.newDiskPath = p
+            }
+        }
+    }
+    Process {
+        id: importFilePicker
+        command: ["zenity", "--file-selection", "--title=Select OVA/VMDK", "--file-filter=OVA/VMDK | *.ova *.vmdk *.vmdk.gz", "--file-filter=All files | *"]
+        stdout: StdioCollector { id: importFileOut; waitForEnd: true }
+        stderr: StdioCollector { waitForEnd: true }
+        onExited: function(code) {
+            if (code === 0) {
+                var p = importFileOut.text.trim()
+                if (p) {
+                    root.importFile = p
+                    if (!root.importVmName) {
+                        var base = p.split("/").pop().split(".")[0].replace(/[^a-zA-Z0-9._-]/g, "")
+                        if (base) root.importVmName = base
+                    }
+                    if (!root.importPoolPath && service) root.importPoolPath = service.defaultPoolPath
+                }
             }
         }
     }
@@ -380,6 +408,123 @@ Panel {
                                 }
                             }
                             Button { Layout.fillWidth: true; text: "Cancel"; fontSize: Style.font.caption; onClicked: root.showWizard=false }
+                        }
+                    }
+
+                    // ── Import OVA/VMDK (local) ──
+                    Button {
+                        Layout.fillWidth: true
+                        text: root.showImport ? "▾  Close Import" : "⬆ Import OVA/VMDK"
+                        fontSize: Style.font.caption
+                        onClicked: root.showImport = !root.showImport
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        visible: root.showImport
+                        radius: Style.space(6)
+                        color: Util.alpha(Color.background, 0.4)
+                        border.color: Util.alpha(Color.accent, 0.25)
+                        border.width: 1
+                        implicitHeight: importCol.implicitHeight + Style.space(12)
+                        ColumnLayout {
+                            id: importCol
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(6)
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label { textFormat: Text.PlainText; text: "File *"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                TextField { Layout.fillWidth: true; text: root.importFile; placeholderText: "/path/to/file.ova"; font.pixelSize: Style.font.caption; onTextChanged: root.importFile = text; elide: Text.ElideMiddle }
+                                Button { iconText: "󰉋"; fontFamily: "JetBrainsMono Nerd Font"; fontSize: Style.font.caption; tooltipText: "Browse OVA/VMDK…"; Layout.preferredWidth: Style.space(28); onClicked: importFilePicker.running = true }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label { textFormat: Text.PlainText; text: "Target"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                Label { textFormat: Text.PlainText; text: "KVM local (qemu:///system)"; font.pixelSize: Style.font.caption; color: Color.accent; font.bold: true; Layout.fillWidth: true }
+                                Label { textFormat: Text.PlainText; text: "Proxmox excluded"; font.pixelSize: Style.font.caption -1; color: Color.muted; opacity: 0.6 }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label { textFormat: Text.PlainText; text: "VM Name *"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                TextField { Layout.fillWidth: true; text: root.importVmName; placeholderText: "my-vm"; font.pixelSize: Style.font.caption; onTextChanged: root.importVmName = text }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label { textFormat: Text.PlainText; text: "RAM MB"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                SpinBox { from: 256; to: 65536; stepSize: 256; value: root.importMem; onValueChanged: root.importMem = value; Layout.preferredWidth: Style.space(90) }
+                                Label { textFormat: Text.PlainText; text: "vCPUs"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                SpinBox { from: 1; to: 32; value: root.importVcpus; onValueChanged: root.importVcpus = value; Layout.preferredWidth: Style.space(70) }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label { textFormat: Text.PlainText; text: "Pool Path *"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                TextField { Layout.fillWidth: true; text: root.importPoolPath; placeholderText: service ? service.defaultPoolPath : "/var/lib/libvirt/images"; font.pixelSize: Style.font.caption; onTextChanged: root.importPoolPath = text }
+                                Button { iconText: "󰉋"; fontFamily: "JetBrainsMono Nerd Font"; fontSize: Style.font.caption; tooltipText: "Browse directory…"; Layout.preferredWidth: Style.space(28); onClicked: poolDirPicker.running = true }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label { textFormat: Text.PlainText; text: "OS Variant"; font.pixelSize: Style.font.caption; color: Color.muted }
+                                SearchableDropdown {
+                                    Layout.fillWidth: true
+                                    value: root.importOsVariant
+                                    options: service ? (service.osVariants.length? service.osVariants : ["generic","debian12","ubuntu24.04"]) : ["generic"]
+                                    placeholderText: "Search OS…"
+                                    onChanged: function(value){ root.importOsVariant = value }
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                CheckBox { id: importNoCreateChk; text: "Only convert (no VM creation)"; checked: root.importNoCreate; onCheckedChanged: root.importNoCreate = checked; font.pixelSize: Style.font.caption }
+                            }
+                            Button {
+                                Layout.fillWidth: true
+                                text: service && service.importBusy ? "⏳ Importing…" : "⬆ Import"
+                                fontSize: Style.font.caption
+                                enabled: !service.importBusy && root.importFile.length>0 && root.importVmName.length>0 && root.importPoolPath.length>0
+                                onClicked: {
+                                    if (service) service.importDisk({filePath: root.importFile, vmName: root.importVmName, memoryMb: root.importMem, vcpus: root.importVcpus, poolPath: root.importPoolPath, osVariant: root.importOsVariant, noCreate: root.importNoCreate})
+                                }
+                            }
+                            Rectangle {
+                                Layout.fillWidth: true
+                                visible: service && (service.importLog || service.importError)
+                                radius: 4
+                                color: Util.alpha(Color.foreground,0.04)
+                                implicitHeight: Math.min(importLogFlick.contentHeight + 12, Style.space(150))
+                                clip: true
+                                Flickable {
+                                    id: importLogFlick
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    contentWidth: width
+                                    contentHeight: importLogLbl.implicitHeight
+                                    clip: true
+                                    boundsBehavior: Flickable.StopAtBounds
+                                    Label {
+                                        id: importLogLbl
+                                        width: parent.width
+                                        textFormat: Text.PlainText
+                                        text: service ? (service.importLog + (service.importError ? "\n" + service.importError : "")) : ""
+                                        font.family: "JetBrainsMono Nerd Font"
+                                        font.pixelSize: Style.font.caption -1
+                                        color: service && service.importError ? Color.urgent : Color.muted
+                                        wrapMode: Text.Wrap
+                                    }
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                visible: service && service.importLog
+                                spacing: Style.space(4)
+                                Button { text: "⎘ Copy log"; fontSize: Style.font.caption -1; Layout.fillWidth: true; onClicked: root.copyToClipboard(service.importLog) }
+                                Button { text: "Clear"; fontSize: Style.font.caption -1; Layout.fillWidth: true; onClicked: { service.importLog=""; service.importError="" } }
+                            }
                         }
                     }
 

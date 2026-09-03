@@ -501,6 +501,71 @@ Item {
         poolSetProc.running=true
     }
 
+    // ── Import OVA/VMDK (local) ──
+    property bool importBusy: false
+    property string importLog: ""
+    property string importError: ""
+    Process {
+        id: importProc
+        stdout: SplitParser {
+            onRead: function(line) {
+                root.importLog += line + "\n"
+                if (root.importLog.length > 100000) root.importLog = root.importLog.substring(root.importLog.length - 80000)
+            }
+        }
+        stderr: SplitParser {
+            onRead: function(line) {
+                root.importLog += line + "\n"
+                root.importError += line + "\n"
+                if (root.importLog.length > 100000) root.importLog = root.importLog.substring(root.importLog.length - 80000)
+            }
+        }
+        property bool timedOut: false
+        onRunningChanged: {
+            if (running) {
+                timedOut=false
+                importDeadline.restart()
+                root.importBusy=true
+                root.busy=true
+                root.importLog=""
+                root.importError=""
+            } else {
+                importDeadline.stop()
+                root.importBusy=false
+                root.busy=false
+            }
+        }
+        onExited: function(code) {
+            importDeadline.stop()
+            root.importBusy=false
+            root.busy=false
+            if (timedOut) { root.lastError="import timeout (300s)"; root.importError="timeout"; return }
+            if (code === 0) {
+                root.lastError=""
+                root.lastInfo="Import successful"
+                root.importError=""
+                refresh()
+                refreshPools()
+            } else {
+                var err = root.importError ? root.importError.trim() : "Import failed"
+                root.lastError="Import failed (code " + code + "): " + err.substring(0,400)
+                if (!root.importError) root.importError=err
+            }
+        }
+    }
+    Timer { id: importDeadline; interval: 300000; onTriggered: { importProc.timedOut=true; importProc.running=false } }
+    function importDisk(params) {
+        if (!params || !params.filePath) { root.lastError="filePath required"; return }
+        if (!params.vmName) { root.lastError="vmName required"; return }
+        if (!params.poolPath) { root.lastError="poolPath required"; return }
+        var script = root.scriptPath("ova_to_qcow2.sh")
+        var args = [script, "--file", params.filePath, "--vm-name", params.vmName, "--memory", String(params.memoryMb || 2048), "--vcpus", String(params.vcpus || 2), "--pool-path", params.poolPath, "--os-variant", params.osVariant || "generic"]
+        if (params.noCreate) args.push("--no-create")
+        // Use stdbuf for line buffering if available (script already uses stdbuf)
+        importProc.command = args
+        importProc.running = true
+    }
+
     // ── Create VM (virt-install) ──
     Process {
         id: createProc
