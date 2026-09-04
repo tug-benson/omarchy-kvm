@@ -122,7 +122,39 @@ ip a show virbr0
 sudo virsh net-define /usr/share/libvirt/networks/default.xml
 ```
 
-If it fails: `sudo journalctl -u libvirtd -n 50`, check `dnsmasq` and `iptables-nft` installed, and that no other dnsmasq on `192.168.122.0/24` conflicts.
+If it fails: `sudo journalctl -u libvirtd -n 50` (or `journalctl -u virtnetworkd` for modular), check `dnsmasq` and `iptables-nft` installed, and that no other dnsmasq on `192.168.122.0/24` conflicts.
+
+**Troubleshooting NAT (no VM IP, `virsh net-list` empty or `iptables -t nat` empty)** — as encountered on Arch with `iptables-nft`/`nftables` + `UFW` (see https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/):
+
+```bash
+# 1. Check network exists and firewall backend
+virsh --connect qemu:///system net-info default  # Active: yes / Bridge: virbr0 ?
+sudo nft list ruleset | grep -A5 libvirt   # should show table ip/nat LIBVIRT_PRT with MASQUERADE 192.168.122.0/24
+sudo iptables -t nat -L -n -v | grep 192.168.122  # alternative check
+cat /etc/libvirt/network.conf  # should be firewall_backend = "iptables" on Arch with UFW/nft
+
+# 2. If empty / backend is nftables but host uses iptables-nft, fix it:
+echo 'firewall_backend = "iptables"' | sudo tee /etc/libvirt/network.conf
+# For UFW users: UFW sets FORWARD DROP which blocks virbr0
+grep DEFAULT_FORWARD_POLICY /etc/default/ufw  # if DROP, change to ACCEPT
+sudo sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+sudo sed -i 's/#net\/ipv4\/ip_forward=1/net\/ipv4\/ip_forward=1/' /etc/ufw/sysctl.conf
+sudo ufw reload
+
+# 3. Restart daemons (handle both monolithic and modular)
+# Monolithic:
+sudo systemctl restart libvirtd
+# Modular (Arch default as of 2026, with virtqemud/virtnetworkd):
+sudo systemctl enable --now virtqemud.socket virtnetworkd.socket virtstoraged.socket virtinterfaced.socket virtnodedevd.socket virtsecretd.socket virtproxyd.socket
+sudo systemctl restart virtnetworkd
+sudo systemctl restart virtqemud
+sleep 2
+sudo virsh --connect qemu:///system net-destroy default; sudo virsh --connect qemu:///system net-start default
+virsh --connect qemu:///system net-list --all  # should be active yes
+sudo nft list ruleset | grep -A10 "table ip nat"  # should show LIBVIRT_PRT MASQUERADE
+ping -c 2 192.168.122.1  # host's virbr0
+# VM should now get 192.168.122.x via DHCP (check virsh domifaddr <vm> --source lease)
+```
 
 Default XML location (after define):
 ```

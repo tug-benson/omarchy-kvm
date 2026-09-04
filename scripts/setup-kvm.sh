@@ -43,19 +43,63 @@ else
   warn "pacman not found, skip install"
 fi
 
-log "3/5 Enable libvirt daemon ($DAEMON)"
+log "3/5 Enable libvirt daemon ($DAEMON) + firewall backend"
+# Fix firewall_backend for Arch with iptables-nft/nftables (as per user fix for NAT)
+if [[ -f /etc/libvirt/network.conf ]]; then
+  if ! grep -q '^\s*firewall_backend\s*=\s*"iptables"' /etc/libvirt/network.conf; then
+    if grep -q '^\s*#\s*firewall_backend' /etc/libvirt/network.conf || ! grep -q 'firewall_backend' /etc/libvirt/network.conf; then
+      echo 'firewall_backend = "iptables"' | sudo tee -a /etc/libvirt/network.conf >/dev/null && ok "Set firewall_backend = iptables in /etc/libvirt/network.conf (NAT fix)"
+      # Need to restart daemons after changing backend
+      NEED_RESTART=1
+    fi
+  else
+    ok "firewall_backend already iptables"
+  fi
+fi
+# UFW fix: DEFAULT_FORWARD_POLICY should be ACCEPT for libvirt NAT (common cause of virbr0 no network)
+if [[ -f /etc/default/ufw ]] && grep -q 'DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
+  sudo sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw && ok "Fixed UFW DEFAULT_FORWARD_POLICY=ACCEPT (was DROP, blocked virbr0 forwarding)" || warn "Failed to fix UFW"
+  # Also ensure net.ipv4.ip_forward is enabled in ufw sysctl
+  if grep -q '#net/ipv4/ip_forward=1' /etc/ufw/sysctl.conf; then
+    sudo sed -i 's/#net\/ipv4\/ip_forward=1/net\/ipv4\/ip_forward=1/' /etc/ufw/sysctl.conf && ok "Enabled net.ipv4.ip_forward in /etc/ufw/sysctl.conf" || true
+  fi
+  sudo ufw reload 2>&1 | tail -n 5 || true
+fi
+# Ensure ip_forward is enabled
+if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]]; then
+  sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null && echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-libvirt-forward.conf >/dev/null && ok "Enabled ip_forward"
+fi
+
 if [[ "$DAEMON" == "modular" ]]; then
   sudo systemctl enable --now virtqemud.socket || warn "virtqemud.socket enable failed"
   sudo systemctl enable --now virtnetworkd.socket || warn "virtnetworkd.socket enable failed"
   sudo systemctl enable --now virtstoraged.socket || true
   sudo systemctl enable --now virtnodedevd.socket || true
+  sudo systemctl enable --now virtinterfaced.socket 2>/dev/null || true
+  sudo systemctl enable --now virtsecretd.socket 2>/dev/null || true
+  sudo systemctl enable --now virtproxyd.socket 2>/dev/null || true
+  # Also enable the services themselves for autostart
+  sudo systemctl enable --now virtqemud.service 2>/dev/null || true
+  sudo systemctl enable --now virtnetworkd.service 2>/dev/null || true
 else
   sudo systemctl enable --now libvirtd || warn "libvirtd enable failed (try --daemon modular)"
+fi
+# Restart daemons if we changed firewall_backend
+if [[ "${NEED_RESTART:-0}" == "1" ]]; then
+  log "Restarting libvirt daemons after firewall_backend change..."
+  if [[ "$DAEMON" == "modular" ]]; then
+    sudo systemctl restart virtnetworkd 2>&1 | tail -n 5 || true
+    sudo systemctl restart virtqemud 2>&1 | tail -n 5 || true
+  else
+    sudo systemctl restart libvirtd 2>&1 | tail -n 5 || true
+  fi
+  sleep 2
 fi
 # show status without paging
 systemctl is-active libvirtd 2>/dev/null && ok "libvirtd active" || echo "libvirtd: $(systemctl is-active libvirtd 2>&1 || true)"
 systemctl is-active virtqemud.socket 2>/dev/null && ok "virtqemud.socket active" || true
 systemctl is-active virtqemud.service 2>/dev/null && ok "virtqemud active" || true
+systemctl is-active virtnetworkd.service 2>/dev/null && ok "virtnetworkd active" || echo "virtnetworkd: $(systemctl is-active virtnetworkd 2>&1 || true)"
 
 log "4/5 User groups"
 TARGET_USER="${SUDO_USER:-$USER}"
@@ -74,28 +118,62 @@ echo "  Effective groups this shell: $(groups)"
 
 log "5/5 Default NAT network (virbr0)"
 if [[ "$SETUP_NETWORK" == "1" ]]; then
-  # wait a moment for daemon socket
   sleep 2
-  if sudo virsh net-list --all 2>&1 | grep -q default; then
-    if ! sudo virsh net-list --all | grep -q "default.*active"; then
-      sudo virsh net-start default || warn "net-start default failed — see journalctl -u libvirtd"
-    fi
-    sudo virsh net-autostart default || true
-    ok "default network ensured"
-  else
-    warn "default network not defined — defining from /usr/share/libvirt/networks/default.xml"
-    if [[ -f /usr/share/libvirt/networks/default.xml ]]; then
-      sudo virsh net-define /usr/share/libvirt/networks/default.xml || true
-      sudo virsh net-start default || true
-      sudo virsh net-autostart default || true
-    else
-      warn "no default.xml found"
+  # Ensure default network is defined (handle both monolithic and modular daemons)
+  # Use explicit URI for modular
+  VIRSH="virsh --connect qemu:///system"
+  if ! sudo $VIRSH net-list --all 2>&1 | grep -q default; then
+    warn "default network not defined — trying to define"
+    # Try common locations
+    for f in /etc/libvirt/qemu/networks/default.xml /usr/share/libvirt/networks/default.xml; do
+      if [[ -f "$f" ]]; then
+        sudo $VIRSH net-define "$f" 2>&1 | tail -n 5 || true
+        break
+      fi
+    done
+    # If still not found, create a minimal default network (as per libvirt docs)
+    if ! sudo $VIRSH net-list --all 2>&1 | grep -q default; then
+      warn "Creating minimal default network (virbr0 192.168.122.0/24)"
+      cat > /tmp/default-net.xml <<'XML'
+<network>
+  <name>default</name>
+  <forward mode='nat'/>
+  <bridge name='virbr0' stp='on' delay='0'/>
+  <ip address='192.168.122.1' netmask='255.255.255.0'>
+    <dhcp><range start='192.168.122.2' end='192.168.122.254'/></dhcp>
+  </ip>
+</network>
+XML
+      sudo $VIRSH net-define /tmp/default-net.xml 2>&1 | tail -n 5 || true
+      rm -f /tmp/default-net.xml
     fi
   fi
+  # Now ensure it is active (handle case where it was defined but not started due to firewall_backend change)
+  if sudo $VIRSH net-list --all 2>&1 | grep -q "default.*active"; then
+    ok "default network already active"
+  else
+    # Try to start, if fails due to already active but not listed, try destroy/start cycle (as user did for firewall_backend fix)
+    if ! sudo $VIRSH net-start default 2>&1 | tail -n 5; then
+      warn "net-start failed, trying destroy/start cycle (firewall_backend fix)"
+      sudo $VIRSH net-destroy default 2>&1 | tail -n 5 || true
+      sleep 1
+      # For modular, ensure virtnetworkd is running
+      sudo systemctl restart virtnetworkd 2>&1 | tail -n 5 || true
+      sudo systemctl restart virtqemud 2>&1 | tail -n 5 || true
+      sleep 2
+      sudo $VIRSH net-start default 2>&1 | tail -n 5 || warn "net-start still failed — check journalctl -u virtnetworkd"
+    fi
+  fi
+  sudo $VIRSH net-autostart default 2>&1 | tail -n 5 || true
+  ok "default network ensured"
   echo "--- virsh net-list --all ---"
-  sudo virsh net-list --all || virsh net-list --all || true
+  sudo $VIRSH net-list --all || virsh net-list --all || true
   echo "--- virbr0 ---"
   ip a show virbr0 2>&1 | head -n 20 || warn "virbr0 not present yet"
+  echo "--- iptables NAT (should show MASQUERADE for 192.168.122.0/24) ---"
+  sudo iptables -t nat -L -n -v 2>&1 | grep -A2 "192.168.122" | head -n 20 || echo "no iptables NAT rules (may be using nftables, check 'nft list ruleset | grep LIBVIRT')"
+  echo "--- nft ruleset LIBVIRT (if using nftables) ---"
+  sudo nft list ruleset 2>&1 | grep -A10 "LIBVIRT_PRT" | head -n 20 || true
 else
   log "skip network (--no-network)"
 fi
