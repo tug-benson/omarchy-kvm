@@ -660,7 +660,7 @@ Panel {
                                             onClicked: row.isPaused ? service.resumeVm(row.vmName) : service.suspendVm(row.vmName)
                                         }
                                         Button {
-                                            iconText: "󱂬"
+                                            iconText: ""
                                             fontFamily: "JetBrainsMono Nerd Font"
                                             fontSize: Style.font.caption
                                             tooltipText: "Console (virt-viewer)"
@@ -917,6 +917,26 @@ Panel {
                                             spacing: Style.space(6)
                                             TextField { Layout.fillWidth: true; placeholderText: "clone new name"; text: root.cloneDst; font.pixelSize: Style.font.caption; onTextChanged: root.cloneDst=text }
                                             Button { text: "Clone"; fontSize: Style.font.caption; enabled: root.cloneDst.length>0; onClicked: { service.cloneVm(row.vmName, root.cloneDst); root.cloneDst="" } }
+                                        }
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: Style.space(4)
+                                            Label {
+                                                textFormat: Text.PlainText
+                                                text: "󰋽"
+                                                font.family: "JetBrainsMono Nerd Font"
+                                                font.pixelSize: Style.font.caption
+                                                color: Color.muted
+                                            }
+                                            Label {
+                                                Layout.fillWidth: true
+                                                textFormat: Text.PlainText
+                                                text: "To delete the VM, use Undefine (keeps disk) or Undefine + storage (deletes disk). Destroy is force-off for running VMs."
+                                                font.pixelSize: Style.font.caption - 1
+                                                color: Color.muted
+                                                opacity: 0.7
+                                                wrapMode: Text.Wrap
+                                            }
                                         }
                                         RowLayout {
                                             Layout.fillWidth: true
