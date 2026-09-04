@@ -51,6 +51,7 @@ Panel {
     property string confirmAction: ""
     property bool poolsCollapsed: true
     property bool settingsCollapsed: true
+    property bool vmsCollapsed: false
     property string newPoolPath: ""
     property string newPoolName: ""
     property string newDiskPath: ""
@@ -528,32 +529,81 @@ Panel {
                         }
                     }
 
-                    // ── Empty ──
-                    Label {
+                    // ── VM list ── collapsable + scrollable
+                    Rectangle {
                         Layout.fillWidth: true
-                        visible: service && service.filteredVms.length === 0 && service.vms.length === 0
-                        textFormat: Text.PlainText
-                        text: "No VMs — use wizard above or virt-manager"
-                        font.family: Style.font.family; font.pixelSize: Style.font.caption; color: Color.muted
-                        horizontalAlignment: Text.AlignHCenter
-                        topPadding: Style.space(8)
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        visible: service && service.filteredVms.length === 0 && service.vms.length > 0
-                        textFormat: Text.PlainText
-                        text: "No match for filter"
-                        font.family: Style.font.family; font.pixelSize: Style.font.caption; color: Color.muted
-                        horizontalAlignment: Text.AlignHCenter
-                    }
-
-                    // ── VM list ──
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: Style.space(6)
-                        Repeater {
-                            model: service ? service.filteredVms : []
-                            delegate: Rectangle {
+                        radius: Style.space(6)
+                        color: Util.alpha(Color.foreground, 0.02)
+                        border.color: Util.alpha(Color.foreground, 0.06)
+                        border.width: 1
+                        implicitHeight: vmsCol.implicitHeight + Style.space(12)
+                        ColumnLayout {
+                            id: vmsCol
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(6)
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Style.space(6)
+                                Label {
+                                    textFormat: Text.PlainText
+                                    text: root.vmsCollapsed ? "" : ""
+                                    font.family: "JetBrainsMono Nerd Font"
+                                    font.pixelSize: Style.font.caption
+                                    color: Color.accent
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.vmsCollapsed = !root.vmsCollapsed }
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    textFormat: Text.PlainText
+                                    text: "Virtual Machines (" + (service ? service.filteredVms.length : 0) + "/" + (service ? service.totalCount : 0) + ")"
+                                    font.family: Style.font.family
+                                    font.pixelSize: Style.font.caption
+                                    font.bold: true
+                                    color: Color.foreground
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.vmsCollapsed = !root.vmsCollapsed }
+                                }
+                                Label {
+                                    visible: !root.vmsCollapsed && service && service.filteredVms.length > 0
+                                    textFormat: Text.PlainText
+                                    text: service ? service.runningCount + " running" : ""
+                                    font.pixelSize: Style.font.caption - 1
+                                    color: Color.muted
+                                    opacity: 0.7
+                                }
+                            }
+                            Label {
+                                visible: !root.vmsCollapsed && service && service.filteredVms.length === 0 && service.vms.length === 0
+                                Layout.fillWidth: true
+                                textFormat: Text.PlainText
+                                text: "No VMs — use wizard above or virt-manager"
+                                font.family: Style.font.family; font.pixelSize: Style.font.caption; color: Color.muted
+                                horizontalAlignment: Text.AlignHCenter
+                                topPadding: Style.space(4)
+                            }
+                            Label {
+                                visible: !root.vmsCollapsed && service && service.filteredVms.length === 0 && service.vms.length > 0
+                                Layout.fillWidth: true
+                                textFormat: Text.PlainText
+                                text: "No match for filter"
+                                font.family: Style.font.family; font.pixelSize: Style.font.caption; color: Color.muted
+                                horizontalAlignment: Text.AlignHCenter
+                            }
+                            Flickable {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: Math.min(vmsRepeater.implicitHeight + Style.space(6), Style.space(340))
+                                visible: !root.vmsCollapsed
+                                contentWidth: width
+                                contentHeight: vmsRepeater.implicitHeight
+                                clip: true
+                                boundsBehavior: Flickable.StopAtBounds
+                                ColumnLayout {
+                                    id: vmsRepeater
+                                    width: parent.width
+                                    spacing: Style.space(6)
+                                    Repeater {
+                                        model: service ? service.filteredVms : []
+                                        delegate: Rectangle {
                                 id: row
                                 required property var modelData
                                 required property int index
@@ -1003,6 +1053,7 @@ Panel {
                             }
                         }
                     }
+                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Qt.rgba(1,1,1,0.08) }
 
                     // ── Network ──
                     Rectangle {
