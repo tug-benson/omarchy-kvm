@@ -97,8 +97,17 @@ if command -v df >/dev/null 2>&1; then
     fi
 fi
 
-# Create temp dir owned by current user (no sudo)
-TEMP_DIR=$(mktemp -d)
+# Create temp dir owned by current user (no sudo) - use pool path if /tmp too small
+# For large VMDKs (e.g., Kali 15G -> 40G qcow2), /tmp (tmpfs 31G) may be too small
+POOL_AVAIL_TMP=$(df --output=avail -B1 "$POOL_PATH" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+TMP_AVAIL=$(df --output=avail -B1 "/tmp" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+# If pool has more space than /tmp and is writable, use it for temp
+if [[ "$POOL_AVAIL_TMP" -gt "$TMP_AVAIL" ]] && [[ -w "$POOL_PATH" ]]; then
+    TEMP_DIR=$(mktemp -d -p "$POOL_PATH" tmp.ova.XXXXXX 2>/dev/null || mktemp -d)
+    echo "Using pool path for temp (more space): $TEMP_DIR" | stdbuf -oL cat
+else
+    TEMP_DIR=$(mktemp -d)
+fi
 # Ensure cleanup on exit
 cleanup() {
     rm -rf "$TEMP_DIR"
@@ -128,9 +137,44 @@ fi
 
 if [[ $IS_VMDK -eq 1 ]]; then
     echo "Input is already VMDK, skipping OVA extraction..." | stdbuf -oL cat
-    VMDK_FILE="$TEMP_DIR/$(basename "$FILE")"
-    cp -- "$FILE" "$VMDK_FILE"
-    echo "Copied VMDK to $VMDK_FILE" | stdbuf -oL cat
+    # Handle split VMDKs (e.g., kali with -s001.vmdk, -s002.vmdk, etc.)
+    VMDK_DIR="$(dirname "$FILE")"
+    VMDK_BASE="$(basename "$FILE" .vmdk)"
+    SPLIT_FOUND=0
+    # Check for any split parts (e.g., *-s*.vmdk) - handle glob safely
+    shopt -s nullglob
+    for f in "$VMDK_DIR"/"$VMDK_BASE"-s*.vmdk; do
+        if [[ "$f" != "$FILE" && -f "$f" ]]; then SPLIT_FOUND=1; break; fi
+    done
+    if [[ $SPLIT_FOUND -eq 0 ]]; then
+        for f in "$VMDK_DIR"/"$VMDK_BASE"*.vmdk; do
+            if [[ "$f" != "$FILE" && -f "$f" ]]; then SPLIT_FOUND=1; break; fi
+        done
+    fi
+    shopt -u nullglob
+    # Also check via ls for s001 pattern
+    if ls "$VMDK_DIR"/"$VMDK_BASE"-s001.vmdk >/dev/null 2>&1; then SPLIT_FOUND=1; fi
+    if [[ $SPLIT_FOUND -eq 1 ]]; then
+        echo "Detected split VMDK, copying all parts to temp dir..." | stdbuf -oL cat
+        # Copy all related VMDK files for this base
+        shopt -s nullglob
+        cp -- "$VMDK_DIR"/"$VMDK_BASE"*.vmdk "$TEMP_DIR"/ 2>/dev/null || cp -- "$FILE" "$TEMP_DIR"/
+        shopt -u nullglob
+        VMDK_FILE="$TEMP_DIR/$(basename "$FILE")"
+        echo "Copied split VMDK set to $TEMP_DIR" | stdbuf -oL cat
+        ls -lh "$TEMP_DIR"/*.vmdk 2>&1 | stdbuf -oL cat || true
+    else
+        # Single VMDK - use original path directly (avoids copy, handles large files better)
+        # Check if original is readable, if not, copy
+        if [[ -r "$FILE" ]]; then
+            VMDK_FILE="$FILE"
+            echo "Using original VMDK path: $VMDK_FILE" | stdbuf -oL cat
+        else
+            VMDK_FILE="$TEMP_DIR/$(basename "$FILE")"
+            cp -- "$FILE" "$VMDK_FILE"
+            echo "Copied single VMDK to $VMDK_FILE" | stdbuf -oL cat
+        fi
+    fi
 elif [[ $IS_VMDK_GZ -eq 1 ]]; then
     echo "Input is VMDK.GZ, decompressing..." | stdbuf -oL cat
     VMDK_FILE="$TEMP_DIR/$(basename "${FILE%.gz}")"
