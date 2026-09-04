@@ -24,29 +24,50 @@ def main():
     out,err,code=run(cmd)
     if code!=0:
         print((err or out).strip(), file=sys.stderr); sys.exit(code)
-    # if removeStorage, parse dumpxml for disks and delete vols
+    # if removeStorage, delete the volume from its pool (handle both old and new pool paths)
     if remove and code==0:
-        xml_out,_,xml_code=run(["virsh","--connect",uri,"dumpxml",vm])
-        # But domain already undefined, so dumpxml fails — try before? We already handled. For now, list vols from default pool that match vm name
-        # Simpler: delete via virsh vol-delete --pool default <vm>.qcow2 if exists
-        # Attempt to find disk files via previous xml if we saved? Fallback: try to delete qcow2 in /var/lib/libvirt/images
+        # Try to find and delete the volume via libvirt (works for any pool, including custom home paths)
+        # First, try to get the volume name from the dumpxml before undefine (we have it from earlier dumpxml if we saved, but we already undefined)
+        # So we try to find volumes in all pools that match the VM name
         import os, glob
-        for path in glob.glob(f"/var/lib/libvirt/images/{vm}*"):
-            try:
-                # try virStorageVolDelete via virsh vol-delete
-                vol_name=os.path.basename(path)
-                run(["virsh","--connect",uri,"vol-delete","--pool","default",vol_name])
-                # fallback rm
-                if os.path.exists(path):
+        # Try all pools
+        pools_out, _, _ = run(["virsh","--connect",uri,"pool-list","--name"])
+        pools = [p.strip() for p in pools_out.splitlines() if p.strip()]
+        for pool in pools:
+            vol_list, _, _ = run(["virsh","--connect",uri,"vol-list","--pool",pool])
+            for line in vol_list.splitlines():
+                if vm in line:
+                    parts=line.split()
+                    if parts:
+                        vol_name=parts[0]
+                        print(f"Deleting volume {vol_name} from pool {pool}...", flush=True)
+                        out_vol, err_vol, code_vol = run(["virsh","--connect",uri,"vol-delete","--pool",pool,vol_name])
+                        if code_vol==0:
+                            print(f"Volume {vol_name} deleted from {pool}", flush=True)
+                        else:
+                            print(f"vol-delete failed for {vol_name} in {pool}: {err_vol.strip()}", file=sys.stderr)
+                            # Fallback: try to remove file directly if we can find its path
+                            # Get vol path via vol-dumpxml
+                            vol_xml, _, _ = run(["virsh","--connect",uri,"vol-dumpxml","--pool",pool,vol_name])
+                            m=re.search(r"<path>(.*?)</path>", vol_xml)
+                            if m:
+                                fpath=m.group(1).strip()
+                                if os.path.exists(fpath):
+                                    try:
+                                        os.remove(fpath)
+                                        print(f"Removed file {fpath} directly", flush=True)
+                                    except Exception as e:
+                                        print(f"Failed to remove {fpath}: {e}", file=sys.stderr)
+        # Also try direct file removal for common locations (fallback for old pools)
+        for path in glob.glob(f"/var/lib/libvirt/images/{vm}*") + glob.glob(f"/home/*/Documents/vms/{vm}*") + glob.glob(f"/home/*/VMs/{vm}*"):
+            if os.path.exists(path):
+                try:
+                    # Try vol-delete first if pool is known, otherwise just rm
+                    print(f"Removing file {path}...", flush=True)
                     os.remove(path)
-            except: pass
-        # also try pool vol-list
-        vol_list,_ ,_ = run(["virsh","--connect",uri,"vol-list","--pool","default"])
-        for line in vol_list.splitlines():
-            if vm in line:
-                parts=line.split()
-                if parts:
-                    run(["virsh","--connect",uri,"vol-delete","--pool","default",parts[0]])
+                    print(f"Removed {path}", flush=True)
+                except Exception as e:
+                    print(f"Failed to remove {path}: {e}", file=sys.stderr)
     print(out.strip() or "undefined")
 
 if __name__=="__main__":
