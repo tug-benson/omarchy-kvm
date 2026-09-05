@@ -290,6 +290,39 @@ Panel {
                         }
                     }
 
+                    // ── Confirm dialog ──
+                    Rectangle {
+                        Layout.fillWidth: true
+                        visible: root.confirmVm !== ""
+                        radius: Style.space(6)
+                        color: Util.alpha(Color.urgent,0.12)
+                        border.color: Util.alpha(Color.urgent,0.35)
+                        border.width: 1
+                        implicitHeight: confirmCol.implicitHeight + Style.space(12)
+                        ColumnLayout {
+                            id: confirmCol
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(6)
+                            Label { Layout.fillWidth: true; textFormat: Text.PlainText; text: root.confirmAction==="destroy" ? "Force off " + root.confirmVm + " ? Données non enregistrées perdues." : root.confirmAction.indexOf("undefine")!==-1 ? "Supprimer " + root.confirmVm + (root.confirmAction==="undefine-storage" ? " + disques ?" : " ?") : ""; font.family: Style.font.family; font.pixelSize: Style.font.caption; color: Color.urgent; wrapMode: Text.Wrap }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Button { text: "Cancel"; fontSize: Style.font.caption; Layout.fillWidth: true; onClicked: root.confirmVm="" }
+                                Button { text: "Confirm"; fontSize: Style.font.caption; Layout.fillWidth: true;
+                                    onClicked: {
+                                        if (root.confirmAction==="destroy") service.destroyVm(root.confirmVm)
+                                        else if (root.confirmAction==="undefine") service.undefineVm(root.confirmVm, false)
+                                        else if (root.confirmAction==="undefine-storage") service.undefineVm(root.confirmVm, true)
+                                        root.confirmVm=""; root.confirmAction=""
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+
+
+
                     // error / info
                     Label {
                         Layout.fillWidth: true
@@ -1042,6 +1075,7 @@ Panel {
                                                 }
                                             }
                                         }
+                                    }
                                         Label {
                                             Layout.fillWidth: true
                                             textFormat: Text.PlainText
@@ -1053,6 +1087,8 @@ Panel {
                             }
                         }
                     }
+                    }
+                }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Qt.rgba(1,1,1,0.08) }
 
                     // ── Network ──
@@ -1319,38 +1355,6 @@ Panel {
                             }
                         }
                     }
-
-                    // ── Confirm dialog ──
-                    Rectangle {
-                        Layout.fillWidth: true
-                        visible: root.confirmVm !== ""
-                        radius: Style.space(6)
-                        color: Util.alpha(Color.urgent,0.12)
-                        border.color: Util.alpha(Color.urgent,0.35)
-                        border.width: 1
-                        implicitHeight: confirmCol.implicitHeight + Style.space(12)
-                        ColumnLayout {
-                            id: confirmCol
-                            anchors.fill: parent
-                            anchors.margins: Style.space(8)
-                            spacing: Style.space(6)
-                            Label { Layout.fillWidth: true; textFormat: Text.PlainText; text: root.confirmAction==="destroy" ? "Force off " + root.confirmVm + " ? Données non enregistrées perdues." : root.confirmAction.indexOf("undefine")!==-1 ? "Supprimer " + root.confirmVm + (root.confirmAction==="undefine-storage" ? " + disques ?" : " ?") : ""; font.family: Style.font.family; font.pixelSize: Style.font.caption; color: Color.urgent; wrapMode: Text.Wrap }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Button { text: "Cancel"; fontSize: Style.font.caption; Layout.fillWidth: true; onClicked: root.confirmVm="" }
-                                Button { text: "Confirm"; fontSize: Style.font.caption; Layout.fillWidth: true;
-                                    onClicked: {
-                                        if (root.confirmAction==="destroy") service.destroyVm(root.confirmVm)
-                                        else if (root.confirmAction==="undefine") service.undefineVm(root.confirmVm, false)
-                                        else if (root.confirmAction==="undefine-storage") service.undefineVm(root.confirmVm, true)
-                                        root.confirmVm=""; root.confirmAction=""
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-
 
                     Label {
                         Layout.fillWidth: true
