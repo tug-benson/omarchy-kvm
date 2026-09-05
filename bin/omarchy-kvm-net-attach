@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Manage VM network interfaces (NAT vs Bridge)
+
 Supports: list host bridges, list libvirt networks, attach/detach/change interface for a VM.
 """
 import re

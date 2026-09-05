@@ -462,7 +462,7 @@ Item {
     }
     function refreshPoolPath() { poolPathProc.command = ["virsh", "--connect", "qemu:///system", "pool-dumpxml", "default"]; poolPathProc.running = true }
 
-    // ── VM Network (NAT vs Bridge) ── per blog.stephane-robert.info
+    // ── VM Network (NAT vs Bridge) ──
     property string vmNetInfo: ""
     property string vmNetSource: ""
     property string vmNetType: ""
