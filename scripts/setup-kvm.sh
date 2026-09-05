@@ -164,7 +164,8 @@ XML
     fi
   fi
   # Now ensure it is active (handle case where it was defined but not started due to firewall_backend change)
-  if sudo $VIRSH net-list --all 2>&1 | grep -q "default.*active"; then
+  # Use word boundary to avoid matching "inactive" as "active" (common bug on Mac where default is inactive)
+  if sudo $VIRSH net-list --all 2>&1 | grep -qE "default\s+active\b"; then
     ok "default network already active"
   else
     # Try to start, if fails due to already active but not listed, try destroy/start cycle (as user did for firewall_backend fix)
