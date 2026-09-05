@@ -31,7 +31,9 @@ sudo pacman -S --needed \
   swtpm iptables-nft dmidecode
 
 # optional but useful
-sudo pacman -S --needed bridge-utils libguestfs
+sudo pacman -S --needed libguestfs
+# bridge-utils is AUR — use yay/paru if pacman doesn't find it
+yay -S --needed bridge-utils  # or paru -S bridge-utils
 ```
 
 What each does:

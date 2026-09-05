@@ -49,7 +49,9 @@ sudo pacman -S --needed qemu-full virt-manager virt-viewer libvirt dnsmasq edk2-
 # For wizard / import / pool management
 sudo pacman -S --needed virt-install qemu-img libosinfo zenity
 # Optional but recommended
-sudo pacman -S --needed bridge-utils libguestfs
+sudo pacman -S --needed libguestfs
+# bridge-utils is AUR (not in core extra) — use an AUR helper
+yay -S --needed bridge-utils  # or paru -S bridge-utils
 
 # Daemon (choose one: monolithic or modular as of 2026)
 # Monolithic (legacy, simple NAT):

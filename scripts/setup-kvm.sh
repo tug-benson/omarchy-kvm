@@ -38,6 +38,15 @@ if command -v pacman &>/dev/null; then
   sudo pacman -S --needed --noconfirm \
     qemu-full virt-manager virt-viewer libvirt \
     dnsmasq edk2-ovmf swtpm iptables-nft dmidecode || warn "pacman install failed"
+  # Optional: libguestfs is in extra, bridge-utils is AUR (needs yay/paru)
+  sudo pacman -S --needed --noconfirm libguestfs 2>&1 | tail -n 5 || warn "libguestfs not in pacman (try yay -S libguestfs)"
+  if command -v yay &>/dev/null; then
+    yay -S --needed --noconfirm bridge-utils 2>&1 | tail -n 10 || warn "yay bridge-utils failed"
+  elif command -v paru &>/dev/null; then
+    paru -S --needed --noconfirm bridge-utils 2>&1 | tail -n 10 || warn "paru bridge-utils failed"
+  else
+    echo "Note: bridge-utils is AUR (yay/paru) — not in core pacman, skip (install manually: yay -S bridge-utils) if you need bridge networking" | tail -n 5
+  fi
   ok "packages ensured"
 else
   warn "pacman not found, skip install"
