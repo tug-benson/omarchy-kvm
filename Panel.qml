@@ -176,24 +176,14 @@ Panel {
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Style.space(8)
-                        Text {
-                            id: datacenterProbePanel
-                            visible: false
+                        FontMetrics {
+                            id: fmPanel
                             font.family: "JetBrainsMono Nerd Font"
-                            font.pixelSize: Style.space(32)
-                            text: ""
-                            Component.onCompleted: {
-                                root.hasDatacenter = implicitWidth > Style.space(8) && implicitWidth < Style.space(36)
-                                root.kvmGlyph = root.hasDatacenter ? "" : "󰢻"
-                            }
-                            onImplicitWidthChanged: {
-                                root.hasDatacenter = implicitWidth > Style.space(8) && implicitWidth < Style.space(36)
-                                root.kvmGlyph = root.hasDatacenter ? "" : "󰢻"
-                            }
+                            font.pixelSize: 32
                         }
                         Label {
                             textFormat: Text.PlainText
-                            text: root.kvmGlyph
+                            text: fmPanel.boundingRect("").width > 0 && fmPanel.boundingRect("").width !== fmPanel.boundingRect("�").width ? "" : "󰢻"
                             font.family: "JetBrainsMono Nerd Font"
                             font.pixelSize: Style.space(32)
                             color: Color.accent

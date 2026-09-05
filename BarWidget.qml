@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import Quickshell
 import qs.Ui
+import qs.Commons
 
 BarWidget {
     id: root
@@ -36,15 +37,13 @@ BarWidget {
     implicitHeight: barSize
     onBarChanged: injectPanel()
 
-    // Datacenter  (U+E91A) not in stable font — fallback to 󰢻, detect via probe
-    Text {
-        id: datacenterProbe
-        visible: false
+    // Datacenter  (U+E91A) not in stable — fallback to 󰢻, detect via FontMetrics
+    FontMetrics {
+        id: fm
         font.family: "JetBrainsMono Nerd Font"
-        font.pixelSize: Style.space(32)
-        text: ""
+        font.pixelSize: 32
     }
-    readonly property bool hasDatacenter: datacenterProbe.implicitWidth > Style.space(8) && datacenterProbe.implicitWidth < Style.space(36)
+    readonly property bool hasDatacenter: fm.boundingRect("").width > 0 && fm.boundingRect("").width !== fm.boundingRect("�").width
     readonly property string kvmGlyph: hasDatacenter ? "" : "󰢻"
 
     // Nerd Font: kvmGlyph/󰢻 KVM/server, 󰅺 error, 󰐥 play
