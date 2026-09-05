@@ -65,6 +65,9 @@ Panel {
     property string importPoolPath: ""
     property string importOsVariant: "generic"
     property bool importNoCreate: false
+    // Datacenter glyph  fallback (not in stable font)
+    property bool hasDatacenter: false
+    property string kvmGlyph: "󰢻"
 
     // zenity pickers (avoid native FileDialog crash in layer-shell)
     Process {
@@ -173,9 +176,24 @@ Panel {
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Style.space(8)
+                        Text {
+                            id: datacenterProbePanel
+                            visible: false
+                            font.family: "JetBrainsMono Nerd Font"
+                            font.pixelSize: Style.space(32)
+                            text: ""
+                            Component.onCompleted: {
+                                root.hasDatacenter = implicitWidth > Style.space(8) && implicitWidth < Style.space(36)
+                                root.kvmGlyph = root.hasDatacenter ? "" : "󰢻"
+                            }
+                            onImplicitWidthChanged: {
+                                root.hasDatacenter = implicitWidth > Style.space(8) && implicitWidth < Style.space(36)
+                                root.kvmGlyph = root.hasDatacenter ? "" : "󰢻"
+                            }
+                        }
                         Label {
                             textFormat: Text.PlainText
-                            text: "󰢻"
+                            text: root.kvmGlyph
                             font.family: "JetBrainsMono Nerd Font"
                             font.pixelSize: Style.space(32)
                             color: Color.accent

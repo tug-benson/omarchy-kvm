@@ -36,12 +36,23 @@ BarWidget {
     implicitHeight: barSize
     onBarChanged: injectPanel()
 
-    // Nerd Font: 󰢻 KVM/server, 󰅺 error, 󰐥 play
+    // Datacenter  (U+E91A) not in stable font — fallback to 󰢻, detect via probe
+    Text {
+        id: datacenterProbe
+        visible: false
+        font.family: "JetBrainsMono Nerd Font"
+        font.pixelSize: Style.space(32)
+        text: ""
+    }
+    readonly property bool hasDatacenter: datacenterProbe.implicitWidth > Style.space(8) && datacenterProbe.implicitWidth < Style.space(36)
+    readonly property string kvmGlyph: hasDatacenter ? "" : "󰢻"
+
+    // Nerd Font: kvmGlyph/󰢻 KVM/server, 󰅺 error, 󰐥 play
     BarIconButton {
         id: button
         anchors.fill: parent
         bar: root.bar
-        text: !root.libvirtdOk ? "󰅺" : root.runCount > 0 ? "󰢻" : "󰢻"
+        text: !root.libvirtdOk ? "󰅺" : root.kvmGlyph
         // badge via tooltip + optional suffix; keep icon simple for bar
         tooltipText: !root.libvirtdOk ? "KVM: libvirtd not reachable — check systemctl"
                    : root.totalCount === 0 ? "KVM: no VMs"
