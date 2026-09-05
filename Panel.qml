@@ -870,7 +870,7 @@ Panel {
                                             }
                                         }
 
-                                        // network interface (NAT vs Bridge) — per blog.stephane-robert.info
+                                        // network interface (NAT vs Bridge)
                                         Rectangle {
                                             Layout.fillWidth: true
                                             radius: 4
@@ -903,7 +903,7 @@ Panel {
                                                 Label {
                                                     Layout.fillWidth: true
                                                     textFormat: Text.PlainText
-                                                    text: "NAT = private (192.168.122.x), Internet via host. Bridge = LAN IP, needs br0 (see blog.stephane-robert.info)"
+                                                    text: "NAT = private (192.168.122.x), Internet via host. Bridge = LAN IP, needs br0"
                                                     font.pixelSize: Style.font.caption - 1
                                                     color: Color.muted
                                                     wrapMode: Text.Wrap

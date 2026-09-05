@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Manage VM network interfaces (NAT vs Bridge) per https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/
+Manage VM network interfaces (NAT vs Bridge)
 Supports: list host bridges, list libvirt networks, attach/detach/change interface for a VM.
 """
 import re
@@ -130,7 +130,7 @@ def main():
             out_br, _, code_br = run(["ip", "link", "show", source])
             if code_br != 0:
                 print(f"Error: Bridge '{source}' does not exist on host.", file=sys.stderr)
-                print(f"Create it first (see https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/):", file=sys.stderr)
+                print(f"Create it first:", file=sys.stderr)
                 print(f"  nmcli connection add type bridge ifname {source} con-name {source}", file=sys.stderr)
                 print(f"  nmcli connection add type bridge-slave ifname enp5s0 master {source}  # replace enp5s0 with your iface", file=sys.stderr)
                 print(f"  nmcli connection up {source}", file=sys.stderr)
