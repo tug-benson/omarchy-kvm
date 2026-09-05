@@ -1072,6 +1072,7 @@ Panel {
                                                 }
                                             }
                                         }
+                                    }  // expanded detail ColumnLayout (763)
                                         Label {
                                             Layout.fillWidth: true
                                             textFormat: Text.PlainText
@@ -1079,10 +1080,9 @@ Panel {
                                             font.family: Style.font.family; font.pixelSize: Style.font.caption - 1; color: Color.muted; wrapMode: Text.Wrap
                                         }
                                     }
-                                }
-                            }
-                        }
-                    }
+                                }  // Flickable
+                    }  // vmsCol
+                }  // Rectangle VM list
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Qt.rgba(1,1,1,0.08) }
 
                     // ── Network ──
