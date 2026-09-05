@@ -50,6 +50,7 @@ Panel {
     property string confirmVm: ""
     property string confirmAction: ""
     property bool poolsCollapsed: true
+    property bool vmsCollapsed: false
     property bool settingsCollapsed: true
     property string newPoolPath: ""
     property string newPoolName: ""
@@ -1072,7 +1073,6 @@ Panel {
                                                 }
                                             }
                                         }
-                                    }  // expanded detail ColumnLayout (763)
                                         Label {
                                             Layout.fillWidth: true
                                             textFormat: Text.PlainText
@@ -1080,9 +1080,10 @@ Panel {
                                             font.family: Style.font.family; font.pixelSize: Style.font.caption - 1; color: Color.muted; wrapMode: Text.Wrap
                                         }
                                     }
-                                }  // Flickable
-                    }  // vmsCol
-                }  // Rectangle VM list
+                                }
+                            }
+                        }
+                    }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Qt.rgba(1,1,1,0.08) }
 
                     // ── Network ──
