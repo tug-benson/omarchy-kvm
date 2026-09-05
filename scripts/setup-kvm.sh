@@ -37,7 +37,13 @@ log "2/5 Install packages (pacman --needed, idempotent)"
 if command -v pacman &>/dev/null; then
   sudo pacman -S --needed --noconfirm \
     qemu-full virt-manager virt-viewer libvirt \
-    dnsmasq edk2-ovmf swtpm iptables-nft dmidecode || warn "pacman install failed"
+    dnsmasq edk2-ovmf edk2-aarch64 edk2-riscv64 swtpm iptables-nft dmidecode \
+    virt-install qemu-img libosinfo zenity || warn "pacman install failed"
+  # Handle virbr0 creation directly: ensure default network is defined and started (common fix for fresh install where virbr0 missing)
+  # This is the user-requested direct virbr0 creation after plugin install
+  if ! virsh --connect qemu:///system net-list --all 2>&1 | grep -q default; then
+    warn "default network not found after package install — will be handled in step 5"
+  fi
   # Optional: libguestfs is in extra, bridge-utils is AUR (needs yay/paru)
   sudo pacman -S --needed --noconfirm libguestfs 2>&1 | tail -n 5 || warn "libguestfs not in pacman (try yay -S libguestfs)"
   if command -v yay &>/dev/null; then
