@@ -124,7 +124,7 @@ sudo virsh net-define /usr/share/libvirt/networks/default.xml
 
 If it fails: `sudo journalctl -u libvirtd -n 50` (or `journalctl -u virtnetworkd` for modular), check `dnsmasq` and `iptables-nft` installed, and that no other dnsmasq on `192.168.122.0/24` conflicts.
 
-**Troubleshooting NAT (no VM IP, `virsh net-list` empty or `iptables -t nat` empty)** — as encountered on Arch with `iptables-nft`/`nftables` + `UFW` (see https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/):
+**Troubleshooting NAT (no VM IP, `virsh net-list` empty or `iptables -t nat` empty)** — as encountered on Arch with `iptables-nft`/`nftables` + `UFW`:
 
 ```bash
 # 1. Check network exists and firewall backend

@@ -6,12 +6,12 @@ KVM/QEMU VM manager for the [Omarchy](https://omarchy.org) Quattro bar — `qemu
 
 ## Features
 
-- **Live VM list** — `virsh list --all --title` + `dominfo` polling every 3s, badge `running/total` on bar (``)
-- **Lifecycle** — Start (`` green) / Shutdown / Force off (`󰙧` red, `destroy`) / Reboot / Suspend / Resume / Autostart toggle
-- **Console** — `virt-viewer` / `remote-viewer` (``) / `virt-manager --show-domain-console` (SPICE/VNC)
+- **Live VM list** — `virsh list --all --title` + `dominfo` polling every 3s, badge `running/total` on bar
+- **Lifecycle** — Start / Shutdown / Force off (`destroy`) / Reboot / Suspend / Resume / Autostart toggle
+- **Console** — `virt-viewer` / `remote-viewer` / `virt-manager --show-domain-console` (SPICE/VNC)
 - **Snapshots** — Create / List / Revert / Delete (`virsh snapshot-*`)
-- **Network** — Per-VM interface choice: NAT (`network:default`, `virbr0` `192.168.122.0/24`) vs Bridge (`bridge:br0`, LAN IP via box DHCP) — per https://blog.stephane-robert.info/docs/virtualiser/type1/kvm/reseau/ — with `virbr0` status + `Start` (``) / `Stop` (`󰙧`) / `Autostart` toggle
-- **Storage** — Image location settings (`⚙ Image Storage`): change default pool path (`/var/lib/libvirt/images` → `/home/user/VMs` or `/mnt/data`, xmodulo method `pool-dumpxml` → `pool-destroy` → `pool-define` → `pool-start` with `755/711` handling for home paths), pool create/list, `virbr0` + `br0` detection
+- **Network** — Per-VM interface choice: NAT (`network:default`, `virbr0` `192.168.122.0/24`) vs Bridge (`bridge:br0`, LAN IP via host bridge) with `virbr0` status + `Start` / `Stop` / `Autostart` toggle
+- **Storage** — Image location settings (`Image Storage`): change default pool path (`/var/lib/libvirt/images` → `/home/user/VMs` or `/mnt/data`, xmodulo method `pool-dumpxml` → `pool-destroy` → `pool-define` → `pool-start` with `755/711` handling for home paths), pool create/list, `virbr0` + `br0` detection
 - **Disk relink** — Fix `file not found` after pool move: shows current `vda` path, picker for new `*.qcow2`, `Relink` via `virsh dumpxml` → `define`
 - **Hardware** — vCPU / RAM live or cold (`Apply HW` with `Live` toggle), shows `virtio`, `host-passthrough` hints
 - **Import OVA/VMDK** — Local import via `ova_to_qcow2.sh` (non-interactive, `set -euo pipefail`, autodetect `.vmdk`/`*.vmdk.gz` vs OVA tar, `mktemp -d` user-owned, `qemu-img convert -p`, `pool-refresh`, `virt-install --import`): file picker (`*.ova *.vmdk *.vmdk.gz`), `KVM local` target, VM Name / RAM / vCPUs / Pool Path / OS Variant, `--no-create` for convert-only, real-time log with `SplitParser` + `Copy`/`Clear`
@@ -87,16 +87,16 @@ See `INSTALL.md` for full Arch setup (bridge `br0` via `nmcli`/`netplan`, nested
 
 ## Usage
 
-1. Click `` in bar → panel opens (search at top).
-2. **Search / filter** `All / Running / Off / Paused` + ` Filter` + `Open virt-manager` (`󰍉`).
-3. **VM row**: state icon (`󰐥` running green, `󰓛` off, `󰏤` paused) + `vCPU/RAM/autostart/snapshots` + `` details.
-   - Row actions: `⏻ Start` (green) / `⏹ Shutdown` (red) / `󰜉 Reboot` / `󰏤 Suspend/Resume` / ` Console` / ` Force off` (running only).
-   - Expanded: `Autostart` toggle, `vCPU`/`RAM` + `Live` + `Apply HW`, **Disk** (current `vda` path + picker + `Relink` — fixes `file not found` after pool move), **Network** (`NAT` vs `Bridge` per blog, `Type`/`Source` dropdowns, `Live` + `Apply Network`), `Clone` + `Undefine` (`󰋽` info: `Undefine` keeps disk, `Undefine + storage` deletes it — `Destroy` is only force-off), snapshots + `Create`, stats, `OS`/`persistent`/`firmware`.
-4. **Network** (global, just above `Pools & Networks`): `default NAT (virbr0)` `active/inactive • autostart yes/no` + ` Start`/`󰙧 Stop` + `/ Autostart`.
-5. **Image Storage** (`⚙`, collapsable): `Current: /var/lib/libvirt/images` + `Path` + `󰉋` dir picker + `Pool` name + `Move default pool` (xmodulo `pool-dumpxml` → `pool-destroy` → `pool-define` → `pool-start`, handles `/home` `755/711`) / `Create new pool`, `poolDetailText`.
+1. Click the KVM icon in the bar → panel opens (search at top).
+2. **Search / filter** `All / Running / Off / Paused` + filter field + `Open virt-manager`.
+3. **VM row**: state icon + `vCPU/RAM/autostart/snapshots` + details toggle.
+   - Row actions: `Start` / `Shutdown` / `Reboot` / `Suspend/Resume` / `Console` / `Force off` (running only).
+   - Expanded: `Autostart` toggle, `vCPU`/`RAM` + `Live` + `Apply HW`, **Disk** (current `vda` path + picker + `Relink` — fixes `file not found` after pool move), **Network** (`NAT` vs `Bridge`, `Type`/`Source` dropdowns, `Live` + `Apply Network`), `Clone` + `Undefine` (info: `Undefine` keeps disk, `Undefine + storage` deletes it — `Destroy` is only force-off), snapshots + `Create`, stats, `OS`/`persistent`/`firmware`.
+4. **Network** (global, just above `Pools & Networks`): `default NAT (virbr0)` `active/inactive • autostart yes/no` + `Start`/`Stop` + `Autostart` toggle.
+5. **Image Storage** (collapsable): `Current: /var/lib/libvirt/images` + `Path` + dir picker + `Pool` name + `Move default pool` (xmodulo `pool-dumpxml` → `pool-destroy` → `pool-define` → `pool-start`, handles `/home` `755/711`) / `Create new pool`, `poolDetailText`.
 6. **Pools & Networks** (collapsable): `Pools` (`pool-list`, `pool-info`, `vol-list`, `Create pool`) + `Networks` (`net-list`, `net-info`, `net-dhcp-leases`).
-7. **Wizard** (`＋ New VM`, 5 steps): `General` (Name, OS variant `SearchableDropdown`), `Resources` (vCPU, RAM, `Firmware` `Dropdown` `bios`/`uefi`), `Storage` (Disk GB, Pool, ISO path + `󰉋` picker), `Network` (network `default`), `Summary` (log + `Copy`).
-8. **Import OVA/VMDK** (`⬆ Import OVA/VMDK`, collapsable, after wizard): `File *` + `󰉋` picker (`*.ova *.vmdk *.vmdk.gz`), `Target` `KVM local` (`qemu:///system`, Proxmox excluded), `VM Name`*, `RAM`/`vCPUs`, `Pool Path`*, `OS Variant`, `Only convert` checkbox, `Import` → `ova_to_qcow2.sh` (`--no-create` for convert-only) with real-time log (`SplitParser`) + `Copy`/`Clear`.
+7. **Wizard** (`New VM`, 5 steps): `General` (Name, OS variant), `Resources` (vCPU, RAM, `Firmware` `bios`/`uefi`), `Storage` (Disk GB, Pool, ISO path + picker), `Network` (network `default`), `Summary` (log + `Copy`).
+8. **Import OVA/VMDK** (collapsable, after wizard): `File *` + picker (`*.ova *.vmdk *.vmdk.gz`), `Target` `KVM local` (`qemu:///system`, Proxmox excluded), `VM Name`*, `RAM`/`vCPUs`, `Pool Path`*, `OS Variant`, `Only convert` checkbox, `Import` → `ova_to_qcow2.sh` (`--no-create` for convert-only) with real-time log + `Copy`/`Clear`.
 
 ## Security
 
