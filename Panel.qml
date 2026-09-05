@@ -175,7 +175,7 @@ Panel {
                         spacing: Style.space(8)
                         Label {
                             textFormat: Text.PlainText
-                            text: ""
+                            text: "󰢻"
                             font.family: "JetBrainsMono Nerd Font"
                             font.pixelSize: Style.space(32)
                             color: Color.accent

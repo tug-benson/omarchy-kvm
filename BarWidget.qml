@@ -36,12 +36,12 @@ BarWidget {
     implicitHeight: barSize
     onBarChanged: injectPanel()
 
-    // Nerd Font:  KVM/server (was 󰢻), 󰅺 error, 󰐥 play
+    // Nerd Font: 󰢻 KVM/server, 󰅺 error, 󰐥 play
     BarIconButton {
         id: button
         anchors.fill: parent
         bar: root.bar
-        text: !root.libvirtdOk ? "󰅺" : root.runCount > 0 ? "" : ""
+        text: !root.libvirtdOk ? "󰅺" : root.runCount > 0 ? "󰢻" : "󰢻"
         // badge via tooltip + optional suffix; keep icon simple for bar
         tooltipText: !root.libvirtdOk ? "KVM: libvirtd not reachable — check systemctl"
                    : root.totalCount === 0 ? "KVM: no VMs"
