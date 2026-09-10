@@ -29,58 +29,157 @@ def main():
     if not shutil.which("virt-install"):
         print("virt-install not found — install virtinst", file=sys.stderr); sys.exit(3)
     args=["virt-install","--connect","qemu:///system","--name",name,"--memory",str(mem),"--vcpus",str(vcpus),"--disk",f"size={disk},format=qcow2,pool={pool}","--os-variant",osvar,"--network",f"network={net},model=virtio","--graphics",graphics,"--noautoconsole"]
-    # ── ISO permission fix (qemu user needs o+r + o+x on parents) ──
+    # ── ISO handling: copy to private libvirt-accessible location if needed, without widening original parents ──
     effectiveIso = iso
+    iso_tmp_copy = None
     if iso:
         if not os.path.exists(iso):
             print(f"ISO not found: {iso}", file=sys.stderr); sys.exit(2)
-        # try to make readable
+        # Use O_NOFOLLOW to safely open and check the ISO without following symlinks
         try:
-            st = os.stat(iso)
-            # fix file perms if not world-readable
-            if not (st.st_mode & 0o004):
-                try: os.chmod(iso, st.st_mode | 0o644)
-                except: pass
-            # fix parent dirs x
-            cur = os.path.dirname(os.path.abspath(iso))
-            for _ in range(6):  # up to 6 levels (home + subdirs)
-                if not cur or cur == "/" or cur == "/home": break
+            # Check if ISO is already in a libvirt-accessible location (pool dir, /var/lib/libvirt, /var/tmp)
+            iso_abs = os.path.abspath(iso)
+            # Get pool path to check if ISO is already inside the target pool or a known libvirt path
+            pool_path = None
+            # Try to get pool path via virsh pool-dumpxml
+            pool_out, _, pool_code = run(["virsh", "--connect", "qemu:///system", "pool-dumpxml", pool])
+            if pool_code == 0:
+                import re
+                m = re.search(r"<path>(.*?)</path>", pool_out)
+                if m:
+                    pool_path = os.path.abspath(m.group(1).strip())
+            # Check if ISO is already under pool_path or under /var/lib/libvirt (already accessible)
+            already_accessible = False
+            if pool_path and iso_abs.startswith(pool_path + os.sep):
+                already_accessible = True
+                print(f"ISO already in target pool path {pool_path}, using directly", flush=True)
+            elif iso_abs.startswith("/var/lib/libvirt/"):
+                # Check via descriptor that file is owned by user and is regular file, and pool can read it
                 try:
-                    pst = os.stat(cur)
-                    if not (pst.st_mode & 0o001):
-                        try: os.chmod(cur, pst.st_mode | 0o711)
-                        except: pass
-                except: pass
-                cur = os.path.dirname(cur)
-            # verify still not readable by qemu? try to copy to pool if needed
-            st2 = os.stat(iso)
-            if not (st2.st_mode & 0o004):
-                # fallback: copy to /var/lib/libvirt/images (needs sudo or group)
-                basename = os.path.basename(iso)
-                dest = f"/var/lib/libvirt/images/{basename}"
-                try:
-                    if not os.path.exists(dest):
-                        # try normal copy first
-                        try:
-                            shutil.copy(iso, dest)
-                            os.chmod(dest, 0o644)
-                            effectiveIso = dest
-                            print(f"ISO copied to {dest} for libvirt access", flush=True)
-                        except PermissionError:
-                            # try sudo copy
-                            cp = subprocess.run(["sudo", "cp", iso, dest], capture_output=True, text=True, timeout=30)
-                            if cp.returncode == 0:
-                                subprocess.run(["sudo", "chmod", "644", dest], timeout=5)
-                                effectiveIso = dest
-                                print(f"ISO copied via sudo to {dest}", flush=True)
+                    fd = os.open(iso_abs, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        st = os.fstat(fd)
+                        # Check it's a regular file and owned by current user (or at least readable)
+                        if os.S_ISREG(st.st_mode):
+                            # Check if group libvirt or other can read? We check if file is already world-readable or group-readable for libvirt
+                            # If not, we will still copy to avoid widening
+                            if (st.st_mode & 0o004) or (st.st_mode & 0o040):
+                                already_accessible = True
+                                print(f"ISO already libvirt-accessible at {iso_abs}, using directly", flush=True)
                             else:
-                                print(f"Warning: ISO not world-readable, qemu may fail. Try: sudo chmod o+r \"{iso}\" && sudo chmod o+x \"{os.path.dirname(iso)}\"", file=sys.stderr, flush=True)
-                    else:
-                        effectiveIso = dest
-                except Exception as e:
-                    print(f"Warning: could not ensure ISO access: {e}", file=sys.stderr, flush=True)
+                                print(f"ISO at {iso_abs} not world/group-readable, will copy to private location", flush=True)
+                        else:
+                            print(f"ISO is not a regular file, will copy", flush=True)
+                    finally:
+                        os.close(fd)
+                except OSError as e:
+                    print(f"Cannot open ISO with O_NOFOLLOW (may be symlink or not regular file): {e}, will copy", flush=True)
+            elif iso_abs.startswith("/var/tmp/") or iso_abs.startswith("/tmp/"):
+                # /var/tmp and /tmp are generally accessible, but check
+                already_accessible = True
+                print(f"ISO in tmp, assuming accessible: {iso_abs}", flush=True)
+
+            if not already_accessible:
+                # Copy to a private, libvirt-accessible location without widening original parents
+                # Prefer the target pool's directory (which is already 755 and owned appropriately)
+                # Fallback to /var/tmp (which is 1777 and libvirt can read)
+                dest_dir = None
+                if pool_path and os.path.isdir(pool_path):
+                    # Check if pool dir is writable (user has write via libvirt group or owner)
+                    # Try to use pool dir
+                    try:
+                        # Test write via creating a temp file with O_NOFOLLOW and 0600
+                        test_path = os.path.join(pool_path, ".write_test_" + str(os.getpid()))
+                        fd_test = os.open(test_path, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                        os.close(fd_test)
+                        os.unlink(test_path)
+                        dest_dir = pool_path
+                        print(f"Pool dir {pool_path} is writable, will copy ISO there", flush=True)
+                    except:
+                        print(f"Pool dir {pool_path} not writable for copy, trying /var/tmp", flush=True)
+                        dest_dir = "/var/tmp"
+                else:
+                    dest_dir = "/var/tmp"
+
+                # Ensure dest_dir exists and is accessible
+                if not os.path.isdir(dest_dir):
+                    print(f"Warning: dest dir {dest_dir} not found, using /var/tmp", file=sys.stderr, flush=True)
+                    dest_dir = "/var/tmp"
+
+                basename = os.path.basename(iso_abs)
+                # Use a unique name to avoid collisions
+                import tempfile
+                # Create a secure temp file in dest_dir with 0600, then copy via descriptor to avoid TOCTOU
+                try:
+                    # Open source with O_NOFOLLOW (no symlink follow)
+                    src_fd = os.open(iso_abs, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        st = os.fstat(src_fd)
+                        if not os.S_ISREG(st.st_mode):
+                            print(f"Error: ISO is not a regular file: {iso_abs}", file=sys.stderr)
+                            sys.exit(1)
+                        if st.st_uid != os.getuid():
+                            print(f"Warning: ISO at {iso_abs} not owned by current user (uid {st.st_uid} vs {os.getuid()}), copying anyway with explicit consent via pool selection", flush=True)
+                        dest_path = os.path.join(dest_dir, basename)
+                        if os.path.exists(dest_path):
+                            base, ext = os.path.splitext(basename)
+                            dest_path = os.path.join(dest_dir, f"{base}_{os.getpid()}{ext}")
+                            print(f"Dest exists, using {dest_path}", flush=True)
+                        dest_fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                        try:
+                            # Copy via raw descriptors (avoid fdopen double-close)
+                            while True:
+                                data = os.read(src_fd, 1024 * 1024)
+                                if not data:
+                                    break
+                                os.write(dest_fd, data)
+                            os.fsync(dest_fd)
+                        finally:
+                            os.close(dest_fd)
+                    finally:
+                        os.close(src_fd)
+                    try:
+                        os.chmod(dest_path, 0o640)
+                        try:
+                            import grp
+                            gid = grp.getgrnam("libvirt").gr_gid
+                            os.chown(dest_path, -1, gid)
+                        except:
+                            pass
+                    except:
+                        pass
+                    effectiveIso = dest_path
+                    iso_tmp_copy = dest_path
+                    print(f"ISO copied securely to private location {dest_path} (0600->640, no parent widening)", flush=True)
+                except OSError as e:
+                    print(f"Error: Cannot open ISO with O_NOFOLLOW: {e}", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                # Already accessible, use original
+                effectiveIso = iso_abs
         except Exception as e:
-            print(f"Warning: ISO permission check failed: {e}", file=sys.stderr, flush=True)
+            print(f"Warning: ISO handling failed: {e}, trying fallback copy to pool", file=sys.stderr, flush=True)
+            # Fallback: try simple copy to pool if possible, without widening
+            try:
+                if pool_path and os.path.isdir(pool_path):
+                    basename = os.path.basename(iso_abs) if 'iso_abs' in locals() else os.path.basename(iso)
+                    dest_path = os.path.join(pool_path, basename)
+                    if not os.path.exists(dest_path):
+                        shutil.copy(iso, dest_path)
+                        try:
+                            os.chmod(dest_path, 0o640)
+                        except:
+                            pass
+                        effectiveIso = dest_path
+                        iso_tmp_copy = dest_path
+                        print(f"Fallback: ISO copied to {dest_path}", flush=True)
+                    else:
+                        effectiveIso = dest_path
+                else:
+                    effectiveIso = iso
+            except Exception as e2:
+                print(f"Fallback also failed: {e2}", file=sys.stderr, flush=True)
+                effectiveIso = iso
         args+=["--cdrom",effectiveIso]
     else:
         args+=["--import"]

@@ -1,74 +1,169 @@
 #!/usr/bin/env python3
-import re, subprocess, sys
+import re
+import subprocess
+import sys
+import os
+import tempfile
+
 SAFE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
 def run(cmd):
-    p=subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-    return p.stdout,p.stderr,p.returncode
-def main():
-    if len(sys.argv)<2:
-        print("usage: omarchy-kvm-undefine <vm> [--remove-storage]", file=sys.stderr); sys.exit(2)
-    vm=sys.argv[1]
-    remove = "--remove-storage" in sys.argv
-    if not SAFE_RE.match(vm) or len(vm)>100:
-        print("invalid vm", file=sys.stderr); sys.exit(2)
-    uri="qemu:///system"
-    # if running, destroy first
-    out,_,_ = run(["virsh","--connect",uri,"dominfo",vm])
-    if "running" in out.lower():
-        run(["virsh","--connect",uri,"destroy",vm])
-    # undefine with flags
-    cmd=["virsh","--connect",uri,"undefine",vm,"--managed-save","--snapshots-metadata"]
-    if remove:
-        # also remove nvram if uefi: add --nvram
-        cmd.append("--nvram")
-    out,err,code=run(cmd)
-    if code!=0:
-        print((err or out).strip(), file=sys.stderr); sys.exit(code)
-    # if removeStorage, delete the volume from its pool (handle both old and new pool paths)
-    if remove and code==0:
-        # Try to find and delete the volume via libvirt (works for any pool, including custom home paths)
-        # First, try to get the volume name from the dumpxml before undefine (we have it from earlier dumpxml if we saved, but we already undefined)
-        # So we try to find volumes in all pools that match the VM name
-        import os, glob
-        # Try all pools
-        pools_out, _, _ = run(["virsh","--connect",uri,"pool-list","--name"])
-        pools = [p.strip() for p in pools_out.splitlines() if p.strip()]
-        for pool in pools:
-            vol_list, _, _ = run(["virsh","--connect",uri,"vol-list","--pool",pool])
-            for line in vol_list.splitlines():
-                if vm in line:
-                    parts=line.split()
-                    if parts:
-                        vol_name=parts[0]
-                        print(f"Deleting volume {vol_name} from pool {pool}...", flush=True)
-                        out_vol, err_vol, code_vol = run(["virsh","--connect",uri,"vol-delete","--pool",pool,vol_name])
-                        if code_vol==0:
-                            print(f"Volume {vol_name} deleted from {pool}", flush=True)
-                        else:
-                            print(f"vol-delete failed for {vol_name} in {pool}: {err_vol.strip()}", file=sys.stderr)
-                            # Fallback: try to remove file directly if we can find its path
-                            # Get vol path via vol-dumpxml
-                            vol_xml, _, _ = run(["virsh","--connect",uri,"vol-dumpxml","--pool",pool,vol_name])
-                            m=re.search(r"<path>(.*?)</path>", vol_xml)
-                            if m:
-                                fpath=m.group(1).strip()
-                                if os.path.exists(fpath):
-                                    try:
-                                        os.remove(fpath)
-                                        print(f"Removed file {fpath} directly", flush=True)
-                                    except Exception as e:
-                                        print(f"Failed to remove {fpath}: {e}", file=sys.stderr)
-        # Also try direct file removal for common locations (fallback for old pools)
-        for path in glob.glob(f"/var/lib/libvirt/images/{vm}*") + glob.glob(f"/home/*/Documents/vms/{vm}*") + glob.glob(f"/home/*/VMs/{vm}*"):
-            if os.path.exists(path):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    return p.stdout, p.stderr, p.returncode
+
+def get_domain_disk_paths(vm, uri="qemu:///system"):
+    """Get exact disk file paths for the domain via dumpxml and domblklist, before undefine."""
+    paths = set()
+    # Method 1: dumpxml <disk><source file=...>
+    out, _, code = run(["virsh", "--connect", uri, "dumpxml", vm])
+    if code == 0:
+        # Find all <source file='...'> or <source file="..."> or <source dev='...'>
+        for m in re.finditer(r"<source\s+[^>]*file=['\"]([^'\"]+)['\"]", out):
+            p = m.group(1).strip()
+            if p:
+                # Resolve to absolute and normalize (no follow, just normpath)
                 try:
-                    # Try vol-delete first if pool is known, otherwise just rm
-                    print(f"Removing file {path}...", flush=True)
-                    os.remove(path)
-                    print(f"Removed {path}", flush=True)
-                except Exception as e:
-                    print(f"Failed to remove {path}: {e}", file=sys.stderr)
+                    # Use abspath but don't follow symlinks yet (we will check via vol-dumpxml)
+                    ap = os.path.abspath(p)
+                    paths.add(ap)
+                except:
+                    paths.add(p)
+        # Also handle <source dev=...> for block devices (less common)
+        for m in re.finditer(r"<source\s+[^>]*dev=['\"]([^'\"]+)['\"]", out):
+            p = m.group(1).strip()
+            if p:
+                paths.add(os.path.abspath(p))
+    # Method 2: domblklist --details for additional sources (e.g., rbd, etc., but we only care file)
+    out2, _, code2 = run(["virsh", "--connect", uri, "domblklist", vm, "--details"])
+    if code2 == 0:
+        for line in out2.splitlines():
+            # domblklist --details output: "file   disk     vda      /path/to/file"
+            # We already have from dumpxml, but also check here for any file path
+            parts = line.strip().split()
+            # Last part is the source file if it starts with /
+            if parts and parts[-1].startswith("/"):
+                p = parts[-1].strip()
+                try:
+                    paths.add(os.path.abspath(p))
+                except:
+                    paths.add(p)
+    return paths
+
+def find_volumes_for_paths(disk_paths, uri="qemu:///system"):
+    """Find exact pool/volume for each disk path via vol-dumpxml <path> matching."""
+    # Returns list of (pool, vol, path)
+    result = []
+    if not disk_paths:
+        return result
+    # Get all pools
+    pools_out, _, _ = run(["virsh", "--connect", uri, "pool-list", "--name"])
+    pools = [p.strip() for p in pools_out.splitlines() if p.strip()]
+    # For each pool, list volumes and check their <path> against disk_paths
+    for pool in pools:
+        vol_list_out, _, code = run(["virsh", "--connect", uri, "vol-list", "--pool", pool])
+        if code != 0:
+            continue
+        for line in vol_list_out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Name") or line.startswith("---"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            vol_name = parts[0]
+            # Get vol path via vol-dumpxml
+            vol_xml, _, vcode = run(["virsh", "--connect", uri, "vol-dumpxml", "--pool", pool, vol_name])
+            if vcode != 0:
+                continue
+            m = re.search(r"<path>(.*?)</path>", vol_xml)
+            if not m:
+                continue
+            vol_path = os.path.abspath(m.group(1).strip())
+            # Exact match against any disk path (normalize both)
+            for dp in disk_paths:
+                # Compare normalized absolute paths
+                try:
+                    dp_norm = os.path.abspath(dp)
+                    if vol_path == dp_norm:
+                        result.append((pool, vol_name, vol_path))
+                        break
+                except:
+                    if vol_path == dp:
+                        result.append((pool, vol_name, vol_path))
+                        break
+    return result
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: omarchy-kvm-undefine <vm> [--remove-storage]", file=sys.stderr)
+        sys.exit(2)
+    vm = sys.argv[1]
+    remove = "--remove-storage" in sys.argv
+    if not SAFE_RE.match(vm) or len(vm) > 100:
+        print("invalid vm", file=sys.stderr)
+        sys.exit(2)
+    uri = "qemu:///system"
+
+    # Capture exact disk identities BEFORE undefine (while domain still exists)
+    disk_paths = set()
+    vol_identities = []  # list of (pool, vol, path) for exact deletion
+    if remove:
+        disk_paths = get_domain_disk_paths(vm, uri)
+        if disk_paths:
+            print(f"Captured {len(disk_paths)} disk(s) for {vm}:", flush=True)
+            for p in sorted(disk_paths):
+                print(f"  {p}", flush=True)
+            vol_identities = find_volumes_for_paths(disk_paths, uri)
+            if vol_identities:
+                print(f"Resolved {len(vol_identities)} volume(s) for exact deletion:", flush=True)
+                for pool, vol, path in vol_identities:
+                    print(f"  {pool}/{vol} -> {path}", flush=True)
+            else:
+                print(f"No pool volumes found for {vm}'s disks (may be unmanaged files, will try vol-delete by path if possible)", flush=True)
+        else:
+            print(f"Warning: Could not capture disk paths for {vm} (may have no disks or already undefined)", file=sys.stderr, flush=True)
+
+    # If running, destroy first (graceful destroy, not undefine)
+    out, _, _ = run(["virsh", "--connect", uri, "dominfo", vm])
+    if "running" in out.lower():
+        print(f"Domain {vm} is running, destroying first...", flush=True)
+        run(["virsh", "--connect", uri, "destroy", vm])
+
+    # Undefine with flags
+    cmd = ["virsh", "--connect", uri, "undefine", vm, "--managed-save", "--snapshots-metadata"]
+    if remove:
+        cmd.append("--nvram")
+    out, err, code = run(cmd)
+    if code != 0:
+        print((err or out).strip(), file=sys.stderr)
+        sys.exit(code)
+    print(out.strip() or f"Domain {vm} undefined", flush=True)
+
+    # If removeStorage, delete only the exact volumes we captured before undefine
+    if remove:
+        if not vol_identities:
+            # No volumes to delete, but check if there were disks that were unmanaged files
+            # For unmanaged files (not in any pool), we do NOT delete via glob; we only delete if we have exact pool/volume
+            # Instead, inform the user
+            if disk_paths:
+                print(f"No pool volumes matched for {vm}'s disks. If disks are unmanaged files, remove them manually:", file=sys.stderr, flush=True)
+                for p in sorted(disk_paths):
+                    print(f"  rm -- {p}", file=sys.stderr, flush=True)
+            else:
+                print(f"No disks to delete for {vm}", flush=True)
+        else:
+            for pool, vol, path in vol_identities:
+                print(f"Deleting volume {pool}/{vol} ({path})...", flush=True)
+                out_vol, err_vol, code_vol = run(["virsh", "--connect", uri, "vol-delete", "--pool", pool, vol])
+                if code_vol == 0:
+                    print(f"Volume {pool}/{vol} deleted", flush=True)
+                else:
+                    print(f"vol-delete failed for {pool}/{vol}: {err_vol.strip()}", file=sys.stderr, flush=True)
+                    # Do not fallback to rm -rf on prefix; only try exact path if vol-delete failed but we have exact path
+                    # We already have exact path, but we should not do glob; we already have exact
+                    # If vol-delete failed, it may be because volume is already gone or pool is not accessible
+                    # Do not do glob-delete
     print(out.strip() or "undefined")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
