@@ -284,10 +284,15 @@ if ! mv -- "$QCOW2_TEMP_PATH" "$FINAL_PATH"; then
     echo "Error: Failed to move QCOW2 to $FINAL_PATH" >&2
     exit 1
 fi
-# Ensure qemu can read it (for /home paths, parent dirs need o+x, file needs o+r)
-chmod 644 -- "$FINAL_PATH" 2>/dev/null || true
-# For home pools, ensure parent is accessible (best effort, no sudo)
-# The pool's dir already has 755 from earlier, but ensure file is readable
+# Secure disk permissions: 640 not 644 — 644 made guest FS world-readable
+# when pool path was traversable (e.g. ~/VMs 755). Use 640 (owner rw,
+# group r for qemu via libvirt/qemu group) and no world perms, with
+# best-effort chgrp so qemu can still read without widening.
+chmod 640 -- "$FINAL_PATH" 2>/dev/null || chmod 600 -- "$FINAL_PATH" 2>/dev/null || true
+chgrp libvirt -- "$FINAL_PATH" 2>/dev/null || chgrp qemu -- "$FINAL_PATH" 2>/dev/null || true
+# For home pools, parent dirs need o+x already handled at pool creation
+# (omarchy-kvm-pool/pool-set-default use 755/711 on parents). Do not
+# chmod parents here and do not re-add world-read to the disk.
 # Refresh the pool that owns this path
 for p in $(virsh --connect qemu:///system pool-list --name 2>/dev/null || true); do
     P_PATH=$(virsh --connect qemu:///system pool-dumpxml "$p" 2>/dev/null | grep -oPm1 "(?<=<path>)[^<]+")
