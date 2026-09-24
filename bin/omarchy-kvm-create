@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-import subprocess, sys, json, shutil, os
+import subprocess
+import sys
+import json
+import shutil
+import os
+import stat
+import re
 def run(cmd):
     p=subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     return p.stdout,p.stderr,p.returncode
@@ -49,35 +55,55 @@ def main():
                 if m:
                     pool_path = os.path.abspath(m.group(1).strip())
             # Check if ISO is already under pool_path or under /var/lib/libvirt (already accessible)
+            # All checks use O_NOFOLLOW descriptor to avoid symlink races
             already_accessible = False
             if pool_path and iso_abs.startswith(pool_path + os.sep):
-                already_accessible = True
-                print(f"ISO already in target pool path {pool_path}, using directly", flush=True)
-            elif iso_abs.startswith("/var/lib/libvirt/"):
-                # Check via descriptor that file is owned by user and is regular file, and pool can read it
+                # Verify the file is actually under pool_path via descriptor (no symlink escape)
                 try:
                     fd = os.open(iso_abs, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
                         st = os.fstat(fd)
-                        # Check it's a regular file and owned by current user (or at least readable)
-                        if os.S_ISREG(st.st_mode):
-                            # Check if group libvirt or other can read? We check if file is already world-readable or group-readable for libvirt
-                            # If not, we will still copy to avoid widening
+                        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
+                            already_accessible = True
+                            print(f"ISO already in target pool path {pool_path}, using directly", flush=True)
+                        else:
+                            print(f"ISO in pool path but not regular file or not owned by user, will copy", flush=True)
+                    finally:
+                        os.close(fd)
+                except OSError as e:
+                    print(f"ISO in pool path but cannot open safely: {e}, will copy", flush=True)
+            elif iso_abs.startswith("/var/lib/libvirt/"):
+                try:
+                    fd = os.open(iso_abs, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        st = os.fstat(fd)
+                        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
                             if (st.st_mode & 0o004) or (st.st_mode & 0o040):
                                 already_accessible = True
                                 print(f"ISO already libvirt-accessible at {iso_abs}, using directly", flush=True)
                             else:
                                 print(f"ISO at {iso_abs} not world/group-readable, will copy to private location", flush=True)
                         else:
-                            print(f"ISO is not a regular file, will copy", flush=True)
+                            print(f"ISO is not a regular file or not owned by user, will copy", flush=True)
                     finally:
                         os.close(fd)
                 except OSError as e:
                     print(f"Cannot open ISO with O_NOFOLLOW (may be symlink or not regular file): {e}, will copy", flush=True)
             elif iso_abs.startswith("/var/tmp/") or iso_abs.startswith("/tmp/"):
-                # /var/tmp and /tmp are generally accessible, but check
-                already_accessible = True
-                print(f"ISO in tmp, assuming accessible: {iso_abs}", flush=True)
+                # Do not trust /tmp blindly — verify via descriptor
+                try:
+                    fd = os.open(iso_abs, os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        st = os.fstat(fd)
+                        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
+                            already_accessible = True
+                            print(f"ISO in tmp and verified as regular file owned by user, using directly: {iso_abs}", flush=True)
+                        else:
+                            print(f"ISO in tmp but not regular file or not owned by user, will copy", flush=True)
+                    finally:
+                        os.close(fd)
+                except OSError as e:
+                    print(f"ISO in tmp but cannot open safely: {e}, will copy", flush=True)
 
             if not already_accessible:
                 # Copy to a private, libvirt-accessible location without widening original parents
@@ -115,7 +141,7 @@ def main():
                     src_fd = os.open(iso_abs, os.O_RDONLY | os.O_NOFOLLOW)
                     try:
                         st = os.fstat(src_fd)
-                        if not os.S_ISREG(st.st_mode):
+                        if not stat.S_ISREG(st.st_mode):
                             print(f"Error: ISO is not a regular file: {iso_abs}", file=sys.stderr)
                             sys.exit(1)
                         if st.st_uid != os.getuid():
@@ -158,28 +184,13 @@ def main():
                 # Already accessible, use original
                 effectiveIso = iso_abs
         except Exception as e:
-            print(f"Warning: ISO handling failed: {e}, trying fallback copy to pool", file=sys.stderr, flush=True)
-            # Fallback: try simple copy to pool if possible, without widening
-            try:
-                if pool_path and os.path.isdir(pool_path):
-                    basename = os.path.basename(iso_abs) if 'iso_abs' in locals() else os.path.basename(iso)
-                    dest_path = os.path.join(pool_path, basename)
-                    if not os.path.exists(dest_path):
-                        shutil.copy(iso, dest_path)
-                        try:
-                            os.chmod(dest_path, 0o640)
-                        except:
-                            pass
-                        effectiveIso = dest_path
-                        iso_tmp_copy = dest_path
-                        print(f"Fallback: ISO copied to {dest_path}", flush=True)
-                    else:
-                        effectiveIso = dest_path
-                else:
-                    effectiveIso = iso
-            except Exception as e2:
-                print(f"Fallback also failed: {e2}", file=sys.stderr, flush=True)
-                effectiveIso = iso
+            print(f"Error: ISO handling failed securely: {e}", file=sys.stderr)
+            print(f"Not using original path to avoid symlink race. Please ensure the ISO is a regular file owned by you.", file=sys.stderr)
+            sys.exit(1)
+        # At this point, effectiveIso is either the original (if already accessible) or the secure copy
+        if 'effectiveIso' not in locals() or not effectiveIso:
+            print(f"Error: Failed to determine effective ISO path", file=sys.stderr)
+            sys.exit(1)
         args+=["--cdrom",effectiveIso]
     else:
         args+=["--import"]
