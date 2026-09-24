@@ -249,10 +249,12 @@ if [[ $NO_CREATE -eq 1 ]]; then
         exit 1
     fi
     # Refresh pool if it's a libvirt pool
-    POOL_NAME=$(virsh --connect qemu:///system pool-list --all 2>/dev/null | awk -v path="$POOL_PATH" '
-        NR>2 { pool=$1; cmd="virsh --connect qemu:///system pool-dumpxml "pool" 2>/dev/null | grep -q \""path">"path"\""; if (system(cmd)==0) print pool }
-    ' | head -n1 || true)
-    # Simpler: try to refresh all pools that match path
+    # Fix: previously used awk system(cmd) with POOL_PATH interpolated into a
+    # shell command (252-254). A crafted pool <path> like '"; touch /tmp/pwn; "'
+    # from pool-dumpxml would execute arbitrary code as the importing user.
+    # Removed that vulnerable awk block entirely. Now only the safe bash loop
+    # below is used: pool path is compared with bash [[ == ]] without ever
+    # invoking a shell, so metacharacters are treated as plain data.
     for p in $(virsh --connect qemu:///system pool-list --name 2>/dev/null || true); do
         P_PATH=$(virsh --connect qemu:///system pool-dumpxml "$p" 2>/dev/null | grep -oPm1 "(?<=<path>)[^<]+")
         if [[ "$P_PATH" == "$POOL_PATH" ]]; then
