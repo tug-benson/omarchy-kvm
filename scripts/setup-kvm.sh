@@ -149,7 +149,10 @@ if [[ "$SETUP_NETWORK" == "1" ]]; then
     # If still not found, create a minimal default network (as per libvirt docs)
     if ! sudo $VIRSH net-list --all 2>&1 | grep -q default; then
       warn "Creating minimal default network (virbr0 192.168.122.0/24)"
-      cat > /tmp/default-net.xml <<'XML'
+      tmp_net_xml=$(mktemp)
+      # mktemp creates 0600 O_EXCL and does not follow symlinks — avoids
+      # predictable /tmp/default-net.xml symlink overwrite when run via sudo
+      cat > "$tmp_net_xml" <<'XML'
 <network>
   <name>default</name>
   <forward mode='nat'/>
@@ -159,8 +162,8 @@ if [[ "$SETUP_NETWORK" == "1" ]]; then
   </ip>
 </network>
 XML
-      sudo $VIRSH net-define /tmp/default-net.xml 2>&1 | tail -n 5 || true
-      rm -f /tmp/default-net.xml
+      sudo $VIRSH net-define "$tmp_net_xml" 2>&1 | tail -n 5 || true
+      rm -f "$tmp_net_xml"
     fi
   fi
   # Now ensure it is active (handle case where it was defined but not started due to firewall_backend change)
