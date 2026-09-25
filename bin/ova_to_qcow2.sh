@@ -113,8 +113,17 @@ cleanup() {
     rm -rf "$TEMP_DIR"
 }
 trap cleanup EXIT
-# Make temp dir accessible (in case libvirt needs it, though we avoid sudo)
-chmod 755 "$TEMP_DIR" 2>/dev/null || true
+# Secure temp dir: mktemp gives 0700; do not widen to 0755. 0755 made the
+# intermediate QCOW2 (created with default umask 022 → 0644) world-readable
+# while the temp dir was traversable, leaking guest data to local users.
+# Keep 0700 (or 0750/0710 with group libvirt if qemu must traverse when
+# TEMP_DIR is under the pool). We use 0700 and best-effort chgrp.
+chmod 700 "$TEMP_DIR" 2>/dev/null || true
+chgrp libvirt "$TEMP_DIR" 2>/dev/null || chgrp qemu "$TEMP_DIR" 2>/dev/null || true
+# If pool temp needed qemu traversal, allow group x without world x:
+if [[ "$TEMP_DIR" == "$POOL_PATH"* ]]; then
+    chmod 750 "$TEMP_DIR" 2>/dev/null || chmod 710 "$TEMP_DIR" 2>/dev/null || true
+fi
 
 echo "Working in temp dir: $TEMP_DIR" | stdbuf -oL cat
 
@@ -230,6 +239,10 @@ if [[ ! -f "$QCOW2_TEMP_PATH" ]]; then
 fi
 
 echo "Conversion successful: $QCOW2_TEMP_PATH ($(du -h "$QCOW2_TEMP_PATH" | cut -f1))" | stdbuf -oL cat
+# Restrict temp QCOW2 immediately — qemu-img respects umask (022 → 644)
+# so without this the file is world-readable while TEMP_DIR was traversable.
+chmod 600 "$QCOW2_TEMP_PATH" 2>/dev/null || true
+chgrp libvirt "$QCOW2_TEMP_PATH" 2>/dev/null || chgrp qemu "$QCOW2_TEMP_PATH" 2>/dev/null || true
 
 # If --no-create, just move to pool and exit
 if [[ $NO_CREATE -eq 1 ]]; then
@@ -248,6 +261,12 @@ if [[ $NO_CREATE -eq 1 ]]; then
         echo "Error: Failed to move QCOW2 to $FINAL_PATH (check permissions)" >&2
         exit 1
     fi
+    # Secure disk permissions even on --no-create: 640 (owner rw, group r)
+    # not 644. Without this the early exit at 267 skipped the chmod 640 at
+    # 291-292, leaving the QCOW2 world-readable when pool is traversable
+    # (e.g. ~/VMs 755). See also temp dir fix at 117.
+    chmod 640 -- "$FINAL_PATH" 2>/dev/null || chmod 600 -- "$FINAL_PATH" 2>/dev/null || true
+    chgrp libvirt -- "$FINAL_PATH" 2>/dev/null || chgrp qemu -- "$FINAL_PATH" 2>/dev/null || true
     # Refresh pool if it's a libvirt pool
     # Fix: previously used awk system(cmd) with POOL_PATH interpolated into a
     # shell command (252-254). A crafted pool <path> like '"; touch /tmp/pwn; "'
