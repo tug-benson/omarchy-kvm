@@ -77,22 +77,30 @@ if [[ $NO_CREATE -eq 0 ]] && ! command -v virt-install >/dev/null 2>&1; then
     exit 1
 fi
 
-# Disk space check (need ~2x source size for extraction + conversion)
+# Disk space check — enforced (not just a warning). A compressed OVA can
+# be a zip-bomb: small FILE but huge extraction. Check both compressed size
+# and, for tar, total uncompressed size (195-203 also re-checks after TEMP_DIR
+# is chosen). Fail rather than let tar exhaust the filesystem.
 if command -v df >/dev/null 2>&1; then
     SRC_SIZE=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
     if [[ "$SRC_SIZE" -gt 0 ]]; then
-        # Use mktemp's parent dir for space check (usually /tmp)
         TMP_PARENT=$(dirname "$(mktemp -u)")
         AVAIL=$(df --output=avail -B1 "$TMP_PARENT" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
-        # Need roughly 2x source + a bit
         NEED=$((SRC_SIZE * 2 + 100*1024*1024))
         if [[ "$AVAIL" -gt 0 && "$AVAIL" -lt "$NEED" ]]; then
-            echo "Warning: Low disk space in $TMP_PARENT (avail $(numfmt --to=iec $AVAIL 2>/dev/null || echo $AVAIL), need ~$(numfmt --to=iec $NEED 2>/dev/null || echo $NEED))" >&2
+            echo "Error: Insufficient space in $TMP_PARENT (avail $(numfmt --to=iec "$AVAIL" 2>/dev/null || echo "$AVAIL"), need ~$(numfmt --to=iec "$NEED" 2>/dev/null || echo "$NEED") for ~2x source + 100MiB headroom). Free space or pick a larger pool." >&2
+            exit 1
         fi
-        # Also check pool path space
         POOL_AVAIL=$(df --output=avail -B1 "$POOL_PATH" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
         if [[ "$POOL_AVAIL" -gt 0 && "$POOL_AVAIL" -lt "$SRC_SIZE" ]]; then
-            echo "Warning: Low disk space in pool $POOL_PATH" >&2
+            echo "Error: Insufficient space in pool $POOL_PATH (avail $(numfmt --to=iec "$POOL_AVAIL" 2>/dev/null || echo "$POOL_AVAIL"), need at least source size). Free space or pick another pool." >&2
+            exit 1
+        fi
+        # Hard cap against absurd archives (e.g. >100 GiB compressed already
+        # suspicious for an OVA; legitimate Kali etc. are <15 GiB compressed)
+        if [[ "$SRC_SIZE" -gt $((100*1024*1024*1024)) ]]; then
+            echo "Error: Source archive >100 GiB ($SRC_SIZE bytes) — refusing (possible bomb or unsupported). Use a smaller OVA/VMDK." >&2
+            exit 1
         fi
     fi
 fi
@@ -187,18 +195,79 @@ if [[ $IS_VMDK -eq 1 ]]; then
 elif [[ $IS_VMDK_GZ -eq 1 ]]; then
     echo "Input is VMDK.GZ, decompressing..." | stdbuf -oL cat
     VMDK_FILE="$TEMP_DIR/$(basename "${FILE%.gz}")"
-    # Use gzip -dc to avoid removing original
-    gzip -dc -- "$FILE" > "$VMDK_FILE"
+    # Enforce decompression size and time limit (gzip bomb). gzip -l gives
+    # uncompressed size in field 2; compare to available space and 80 GiB cap.
+    if command -v gzip >/dev/null 2>&1; then
+        GZ_UNCOMP=$(gzip -l -- "$FILE" 2>/dev/null | awk 'NR==2 {print $2+0}')
+        if [[ "${GZ_UNCOMP:-0}" -gt 0 ]]; then
+            AVAIL_GZ=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+            HARD_GZ=$((80*1024*1024*1024))
+            if [[ "$GZ_UNCOMP" -gt "$HARD_GZ" ]]; then
+                echo "Error: VMDK.GZ uncompressed size $GZ_UNCOMP bytes (>80 GiB) — refusing (likely bomb)." >&2
+                exit 1
+            fi
+            if [[ "$AVAIL_GZ" -gt 0 && "$AVAIL_GZ" -lt "$((GZ_UNCOMP + 200*1024*1024))" ]]; then
+                echo "Error: Not enough space to decompress VMDK.GZ (need ~$GZ_UNCOMP bytes + 200MiB, avail $AVAIL_GZ in $TEMP_DIR)." >&2
+                exit 1
+            fi
+        fi
+    fi
+    # Time-bounded decompression (10 min)
+    if command -v timeout >/dev/null 2>&1; then
+        if ! timeout --preserve-status --kill-after=30 600 bash -c 'gzip -dc -- "$1" > "$2"' _ "$FILE" "$VMDK_FILE" 2>&1 | stdbuf -oL cat; then
+            rc=${PIPESTATUS[0]:-$?}
+            echo "Error: gzip decompression failed or timed out (exit $rc, likely bomb)." >&2
+            exit 1
+        fi
+    else
+        gzip -dc -- "$FILE" > "$VMDK_FILE"
+    fi
     echo "Decompressed to $VMDK_FILE" | stdbuf -oL cat
 else
-    # Assume OVA (tar archive)
+    # Assume OVA (tar archive) — enforce expansion-size and time limit.
+    # The early check at :80-97 only sees compressed size; a zip-bomb can be
+    # tiny on disk but expand to fill the filesystem. Before tar -xf, sum the
+    # uncompressed members via tar -tvf and compare to free space in TEMP_DIR,
+    # and wrap extraction in timeout so a decompression bomb cannot hang the
+    # import indefinitely.
     echo "Extracting OVA $FILE to $TEMP_DIR..." | stdbuf -oL cat
     if ! tar -tf "$FILE" >/dev/null 2>&1; then
         echo "Warning: File does not appear to be a valid tar archive, trying anyway..." >&2 | stdbuf -oL cat
+    else
+        # Enforce expansion-size: sum member sizes (field 3 of tar -tvf)
+        # GNU tar format: "-rw-r--r-- user/group 12345 2024-... name"
+        TAR_TOTAL=$(tar -tvf "$FILE" 2>/dev/null | awk '{s+=$3} END {print s+0}')
+        TAR_TOTAL=${TAR_TOTAL:-0}
+        if [[ "$TAR_TOTAL" -gt 0 ]]; then
+            AVAIL_TMP=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+            # Need decompressed + converted qcow2 roughly 2x, keep 200MiB headroom
+            NEED_TAR=$((TAR_TOTAL + TAR_TOTAL + 200*1024*1024))
+            # Also enforce absolute cap (e.g. 80 GiB uncompressed is already
+            # generous: Kali OVA ~15 GiB -> ~40 GiB qcow2; larger likely a bomb)
+            HARD_CAP=$((80*1024*1024*1024))
+            if [[ "$TAR_TOTAL" -gt "$HARD_CAP" ]]; then
+                echo "Error: OVA uncompressed content $TAR_TOTAL bytes (>80 GiB) — refusing (likely bomb or unsupported)." >&2
+                exit 1
+            fi
+            if [[ "$AVAIL_TMP" -gt 0 && "$AVAIL_TMP" -lt "$NEED_TAR" ]]; then
+                echo "Error: Not enough space to extract OVA (need ~$(numfmt --to=iec "$NEED_TAR" 2>/dev/null || echo "$NEED_TAR") for $TAR_TOTAL bytes + conversion, avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP") in $TEMP_DIR). Free space or use a larger pool." >&2
+                exit 1
+            fi
+            echo "OVA content size: $(numfmt --to=iec "$TAR_TOTAL" 2>/dev/null || echo "$TAR_TOTAL bytes") (avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP"))" | stdbuf -oL cat
+        fi
     fi
-    # Use stdbuf for tar progress if possible
-    if ! tar -xf "$FILE" -C "$TEMP_DIR" 2>&1 | stdbuf -oL cat; then
-        echo "Error: Failed to extract OVA archive" >&2
+    # Time-bounded extraction: 10 min for typical OVAs; kills zip-bomb loops
+    TAR_CMD=(tar -xf "$FILE" -C "$TEMP_DIR")
+    if command -v timeout >/dev/null 2>&1; then
+        TAR_CMD=(timeout --preserve-status --kill-after=30 600 tar -xf "$FILE" -C "$TEMP_DIR")
+    fi
+    if ! "${TAR_CMD[@]}" 2>&1 | stdbuf -oL cat; then
+        rc=${PIPESTATUS[0]:-$?}
+        if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+            echo "Error: OVA extraction timed out after 10 min (likely bomb or very large archive)." >&2
+        else
+            echo "Error: Failed to extract OVA archive (exit $rc)" >&2
+        fi
         exit 1
     fi
     echo "Extraction done, searching for VMDK..." | stdbuf -oL cat
@@ -206,7 +275,15 @@ else
     VMDK_FILE=$(find "$TEMP_DIR" -name "*.vmdk.gz" -print -quit 2>/dev/null || true)
     if [[ -n "$VMDK_FILE" && -f "$VMDK_FILE" ]]; then
         echo "Decompressing $VMDK_FILE..." | stdbuf -oL cat
-        gunzip -- "$VMDK_FILE"
+        # Time-bounded (inherits size limit from TAR_TOTAL check above)
+        if command -v timeout >/dev/null 2>&1; then
+            if ! timeout --preserve-status --kill-after=30 600 gunzip -- "$VMDK_FILE" 2>&1 | stdbuf -oL cat; then
+                echo "Error: gunzip of embedded VMDK.GZ failed or timed out." >&2
+                exit 1
+            fi
+        else
+            gunzip -- "$VMDK_FILE"
+        fi
         VMDK_FILE="${VMDK_FILE%.gz}"
     else
         VMDK_FILE=$(find "$TEMP_DIR" -name "*.vmdk" -print -quit 2>/dev/null || true)
@@ -227,8 +304,20 @@ if [[ ! -r "$VMDK_FILE" ]]; then
 fi
 
 echo "Converting VMDK to QCOW2 at $QCOW2_TEMP_PATH..." | stdbuf -oL cat
-# Use stdbuf to ensure line-buffered output
-if ! stdbuf -oL qemu-img convert -p -O qcow2 -- "$VMDK_FILE" "$QCOW2_TEMP_PATH" 2>&1 | stdbuf -oL cat; then
+# Time-bounded conversion (large VMDKs can take many minutes; 30 min cap
+# prevents a crafted sparse VMDK from hanging the import). Availability
+# already checked at :80-97 via pool space.
+if command -v timeout >/dev/null 2>&1; then
+    if ! stdbuf -oL timeout --preserve-status --kill-after=30 1800 qemu-img convert -p -O qcow2 -- "$VMDK_FILE" "$QCOW2_TEMP_PATH" 2>&1 | stdbuf -oL cat; then
+        rc=${PIPESTATUS[0]:-$?}
+        if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+            echo "Error: qemu-img convert timed out after 30 min." >&2
+        else
+            echo "Error: qemu-img convert failed (exit $rc)" >&2
+        fi
+        exit 1
+    fi
+elif ! stdbuf -oL qemu-img convert -p -O qcow2 -- "$VMDK_FILE" "$QCOW2_TEMP_PATH" 2>&1 | stdbuf -oL cat; then
     echo "Error: qemu-img convert failed" >&2
     exit 1
 fi
