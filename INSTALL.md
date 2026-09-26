@@ -137,11 +137,16 @@ cat /etc/libvirt/network.conf  # should be firewall_backend = "iptables" on Arch
 
 # 2. If empty / backend is nftables but host uses iptables-nft, fix it:
 echo 'firewall_backend = "iptables"' | sudo tee /etc/libvirt/network.conf
-# For UFW users: UFW sets FORWARD DROP which blocks virbr0
-grep DEFAULT_FORWARD_POLICY /etc/default/ufw  # if DROP, change to ACCEPT
-sudo sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-sudo sed -i 's/#net\/ipv4\/ip_forward=1/net\/ipv4\/ip_forward=1/' /etc/ufw/sysctl.conf
+# For UFW users: UFW's FORWARD DROP blocks virbr0. Do NOT flip the global
+# DEFAULT_FORWARD_POLICY to ACCEPT (that forwards on ALL interfaces).
+# Keep DROP and allow forwarding scoped to the libvirt bridge only:
+sudo ufw route allow in on virbr0 from 192.168.122.0/24
+sudo ufw route allow out on virbr0 to 192.168.122.0/24
+sudo sed -i 's|#net/ipv4/ip_forward=1|net/ipv4/ip_forward=1|' /etc/ufw/sysctl.conf
 sudo ufw reload
+# If an older version of this guide set DEFAULT_FORWARD_POLICY="ACCEPT",
+# restore the scoped posture: set it back to "DROP" (route rules above keep
+# libvirt NAT working) and reload.
 
 # 3. Restart daemons (handle both monolithic and modular)
 # Monolithic:

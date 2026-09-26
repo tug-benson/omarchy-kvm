@@ -71,18 +71,44 @@ if [[ -f /etc/libvirt/network.conf ]]; then
     ok "firewall_backend already iptables"
   fi
 fi
-# UFW fix: DEFAULT_FORWARD_POLICY should be ACCEPT for libvirt NAT (common cause of virbr0 no network)
-if [[ -f /etc/default/ufw ]] && grep -q 'DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
-  sudo sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw && ok "Fixed UFW DEFAULT_FORWARD_POLICY=ACCEPT (was DROP, blocked virbr0 forwarding)" || warn "Failed to fix UFW"
-  # Also ensure net.ipv4.ip_forward is enabled in ufw sysctl
-  if grep -q '#net/ipv4/ip_forward=1' /etc/ufw/sysctl.conf; then
-    sudo sed -i 's/#net\/ipv4\/ip_forward=1/net\/ipv4\/ip_forward=1/' /etc/ufw/sysctl.conf && ok "Enabled net.ipv4.ip_forward in /etc/ufw/sysctl.conf" || true
+# UFW fix (scoped): allow forwarding ONLY for the libvirt NAT bridge.
+# Do NOT change the global DEFAULT_FORWARD_POLICY from DROP to ACCEPT and do
+# NOT enable net.ipv4.ip_forward globally via sysctl.d — that would permit
+# forwarding beyond the intended libvirt NAT network and weaken the host
+# firewall for other interfaces. Instead keep the DROP default and add UFW
+# route rules limited to virbr0 / 192.168.122.0/24, so only libvirt guest
+# traffic is forwarded. ip_forward itself is enabled through UFW's own
+# sysctl.conf (applied by UFW on reload); the filter stays scoped because
+# the default forward policy remains DROP.
+if command -v ufw &>/dev/null && [[ -f /etc/default/ufw ]]; then
+  if grep -q 'DEFAULT_FORWARD_POLICY="ACCEPT"' /etc/default/ufw; then
+    warn "UFW DEFAULT_FORWARD_POLICY is ACCEPT (forwards on ALL interfaces). For a scoped libvirt-only setup, restore DROP and rely on the virbr0 route rules below:"
+    echo "  sudo sed -i 's/DEFAULT_FORWARD_POLICY=\"ACCEPT\"/DEFAULT_FORWARD_POLICY=\"DROP\"/' /etc/default/ufw && sudo ufw reload" | tail -n 5
+  else
+    ok "UFW DEFAULT_FORWARD_POLICY stays at DROP (scoped, not global ACCEPT)"
+  fi
+  # Route rules scoped to the libvirt bridge (idempotent — skip if present)
+  if sudo ufw status 2>/dev/null | grep -q "on virbr0"; then
+    ok "UFW virbr0 forward rules already present (scoped to 192.168.122.0/24)"
+  else
+    sudo ufw route allow in on virbr0 from 192.168.122.0/24 2>&1 | tail -n 3 || warn "ufw route allow in on virbr0 failed"
+    sudo ufw route allow out on virbr0 to 192.168.122.0/24 2>&1 | tail -n 3 || warn "ufw route allow out on virbr0 failed"
+    ok "Added UFW forward rules scoped to virbr0 192.168.122.0/24 (default policy untouched)"
+  fi
+  # Let UFW enable the kernel forward knob via its own config (only takes
+  # effect when UFW runs; filtering still limited by DROP + scoped rules)
+  if [[ -f /etc/ufw/sysctl.conf ]] && grep -q '#net/ipv4/ip_forward=1' /etc/ufw/sysctl.conf; then
+    sudo sed -i 's|#net/ipv4/ip_forward=1|net/ipv4/ip_forward=1|' /etc/ufw/sysctl.conf && ok "Enabled net.ipv4.ip_forward in /etc/ufw/sysctl.conf (UFW-managed)" || true
   fi
   sudo ufw reload 2>&1 | tail -n 5 || true
+else
+  echo "Note: UFW not found — no firewall changes made. If guests get no network, allow forwarding scoped to virbr0 only (never set a global ACCEPT forward policy):" | tail -n 5
+  echo "  sudo ufw route allow in on virbr0 from 192.168.122.0/24 && sudo ufw route allow out on virbr0 to 192.168.122.0/24 && sudo ufw reload" | tail -n 5
 fi
-# Ensure ip_forward is enabled
-if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]]; then
-  sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null && echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-libvirt-forward.conf >/dev/null && ok "Enabled ip_forward"
+# Check (do not change): libvirt NAT needs ip_forward=1 at runtime. If it is
+# off, point at the scoped fix above instead of forcing it globally here.
+if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 1)" != "1" ]]; then
+  warn "net.ipv4.ip_forward is 0 — libvirt NAT needs it. Enable it via UFW (see above) or scoped sysctl, not a global ACCEPT policy. After enabling, restart virtnetworkd/libvirtd and net-start default."
 fi
 
 if [[ "$DAEMON" == "modular" ]]; then
