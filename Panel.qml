@@ -65,6 +65,7 @@ Panel {
     property string importPoolPath: ""
     property string importOsVariant: "generic"
     property bool importNoCreate: false
+    property bool importOverwrite: false
     // Datacenter glyph  fallback (not in stable font)
     property bool hasDatacenter: false
     property string kvmGlyph: "󰢻"
@@ -524,13 +525,26 @@ Panel {
                                 Layout.fillWidth: true
                                 CheckBox { id: importNoCreateChk; text: "Only convert (no VM creation)"; checked: root.importNoCreate; onCheckedChanged: root.importNoCreate = checked; font.pixelSize: Style.font.caption }
                             }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                CheckBox { id: importOverwriteChk; text: "Overwrite existing disk (backs up old disk until import succeeds)"; checked: root.importOverwrite; onCheckedChanged: root.importOverwrite = checked; font.pixelSize: Style.font.caption }
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                textFormat: Text.PlainText
+                                text: "Without overwrite, an existing <vm-name>.qcow2 is kept and the import is refused."
+                                font.pixelSize: Style.font.caption - 1
+                                color: Color.muted
+                                wrapMode: Text.Wrap
+                                opacity: 0.7
+                            }
                             Button {
                                 Layout.fillWidth: true
                                 text: service && service.importBusy ? "⏳ Importing…" : "⬆ Import"
                                 fontSize: Style.font.caption
                                 enabled: service && !service.importBusy && root.importFile.length>0 && root.importVmName.length>0 && root.importPoolPath.length>0
                                 onClicked: {
-                                    if (service) service.importDisk({filePath: root.importFile, vmName: root.importVmName, memoryMb: root.importMem, vcpus: root.importVcpus, poolPath: root.importPoolPath, osVariant: root.importOsVariant, noCreate: root.importNoCreate})
+                                    if (service) service.importDisk({filePath: root.importFile, vmName: root.importVmName, memoryMb: root.importMem, vcpus: root.importVcpus, poolPath: root.importPoolPath, osVariant: root.importOsVariant, noCreate: root.importNoCreate, overwrite: root.importOverwrite})
                                 }
                             }
                             Rectangle {

@@ -654,6 +654,7 @@ Item {
         var script = root.scriptPath("ova_to_qcow2.sh")
         var args = [script, "--file", params.filePath, "--vm-name", params.vmName, "--memory", String(params.memoryMb || 2048), "--vcpus", String(params.vcpus || 2), "--pool-path", params.poolPath, "--os-variant", params.osVariant || "generic"]
         if (params.noCreate) args.push("--no-create")
+        if (params.overwrite) args.push("--overwrite")
         // Use stdbuf for line buffering if available (script already uses stdbuf)
         importProc.command = args
         importProc.running = true

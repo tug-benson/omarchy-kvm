@@ -3,12 +3,18 @@ set -euo pipefail
 
 # ova_to_qcow2.sh - Non-interactive OVA/VMDK to qcow2 conversion + KVM VM creation
 # Adapted for Omarchy panel (no read -p, CLI args, set -euo pipefail, autodetect, temp dir owned by user)
-# Usage: ova_to_qcow2.sh --file <path> --vm-name <name> --memory <MB> --vcpus <n> --pool-path </path> --os-variant <id> [--no-create]
+# Usage: ova_to_qcow2.sh --file <path> --vm-name <name> --memory <MB> --vcpus <n> --pool-path </path> --os-variant <id> [--no-create] [--overwrite]
 # --no-create: only convert, do not create VM
+# --overwrite: allow replacing an existing destination QCOW2 (default: refuse).
+#   Without --overwrite the script never deletes the existing disk. With
+#   --overwrite the old disk is moved to a .pre-import backup first and only
+#   removed after the new image (and virt-install, if any) succeed; on any
+#   failure the backup is restored so a repeated import or colliding VM name
+#   cannot silently destroy the prior guest disk.
 # Dependencies: tar, gzip, qemu-img, virsh, virt-install, zenity (for UI picker, not for script), df
 
 usage() {
-    echo "Usage: $0 --file <path> --vm-name <name> --memory <MB> --vcpus <n> --pool-path </path> --os-variant <id> [--no-create]" >&2
+    echo "Usage: $0 --file <path> --vm-name <name> --memory <MB> --vcpus <n> --pool-path </path> --os-variant <id> [--no-create] [--overwrite]" >&2
     echo "  --file        Path to OVA, VMDK or VMDK.GZ file" >&2
     echo "  --vm-name     Name for the new VM (alnum, ., _, -)" >&2
     echo "  --memory      RAM in MB (e.g., 2048)" >&2
@@ -16,6 +22,7 @@ usage() {
     echo "  --pool-path   Target pool directory (e.g., /var/lib/libvirt/images or /home/user/VMs)" >&2
     echo "  --os-variant  OS variant id (e.g., generic, debian12, ubuntu24.04) - see osinfo-query" >&2
     echo "  --no-create   Only convert to qcow2, do not create VM" >&2
+    echo "  --overwrite   Replace existing destination QCOW2 (default: refuse; old disk is backed up and restored on failure)" >&2
     exit 2
 }
 
@@ -27,6 +34,7 @@ VCPUS=""
 POOL_PATH=""
 OS_VARIANT="generic"
 NO_CREATE=0
+OVERWRITE=0
 
 # Parse CLI args
 while [[ $# -gt 0 ]]; do
@@ -38,10 +46,60 @@ while [[ $# -gt 0 ]]; do
         --pool-path) POOL_PATH="$2"; shift 2 ;;
         --os-variant) OS_VARIANT="$2"; shift 2 ;;
         --no-create) NO_CREATE=1; shift ;;
+        --overwrite) OVERWRITE=1; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
     esac
 done
+
+# Helper: refuse an existing destination by default, or back it up when
+# --overwrite was given. Never deletes the old disk outright: with
+# --overwrite the existing file (or symlink) is moved aside to
+# "$FINAL_PATH.pre-import.<pid>" and BACKUP_PATH is set; the caller must
+# remove the backup only after the new image and VM operation succeed,
+# and restore it on any failure.
+BACKUP_PATH=""
+refuse_or_backup_existing() {
+    local dest="$1"
+    BACKUP_PATH=""
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        if [[ "$OVERWRITE" -ne 1 ]]; then
+            echo "Error: Refusing: destination already exists: $dest" >&2
+            echo "A repeated import or colliding VM name would otherwise silently destroy the prior guest disk." >&2
+            echo "Pass --overwrite to replace it (old disk is backed up until the new image and VM operation succeed), or choose another --vm-name." >&2
+            exit 1
+        fi
+        BACKUP_PATH="${dest}.pre-import.$$"
+        if [[ -e "$BACKUP_PATH" || -L "$BACKUP_PATH" ]]; then
+            echo "Error: Backup path already exists, refusing to overwrite: $BACKUP_PATH" >&2
+            exit 1
+        fi
+        if ! mv -- "$dest" "$BACKUP_PATH"; then
+            echo "Error: Failed to back up existing disk $dest to $BACKUP_PATH" >&2
+            exit 1
+        fi
+        echo "Existing disk moved to backup: $BACKUP_PATH (will be removed only after the new image succeeds)..." | stdbuf -oL cat
+    fi
+}
+restore_backup() {
+    local dest="$1"
+    if [[ -n "$BACKUP_PATH" && ( -e "$BACKUP_PATH" || -L "$BACKUP_PATH" ) ]]; then
+        rm -f -- "$dest" 2>/dev/null || true
+        if mv -- "$BACKUP_PATH" "$dest"; then
+            echo "Restored previous disk from backup: $BACKUP_PATH -> $dest" >&2 | stdbuf -oL cat
+        else
+            echo "Error: Failed to restore backup $BACKUP_PATH (previous disk preserved there, new image at $dest may be incomplete)" >&2
+        fi
+        BACKUP_PATH=""
+    fi
+}
+drop_backup() {
+    if [[ -n "$BACKUP_PATH" && ( -e "$BACKUP_PATH" || -L "$BACKUP_PATH" ) ]]; then
+        rm -f -- "$BACKUP_PATH"
+        echo "Backup removed after success: $BACKUP_PATH" | stdbuf -oL cat
+    fi
+    BACKUP_PATH=""
+}
 
 # Validation
 if [[ -z "$FILE" ]]; then echo "Error: --file is required" >&2; usage; fi
@@ -342,18 +400,18 @@ if [[ $NO_CREATE -eq 1 ]]; then
         echo "Error: Pool path not writable: $POOL_PATH (check permissions, user needs write access, avoid sudo for conversion)" >&2
         exit 1
     fi
-    if [[ -f "$FINAL_PATH" ]]; then
-        echo "Warning: $FINAL_PATH already exists, will overwrite" >&2 | stdbuf -oL cat
-        rm -f -- "$FINAL_PATH"
-    fi
+    # Refuse an existing destination by default; with --overwrite the old
+    # disk is moved to a .pre-import backup and only dropped after success.
+    refuse_or_backup_existing "$FINAL_PATH"
     if ! mv -- "$QCOW2_TEMP_PATH" "$FINAL_PATH"; then
         echo "Error: Failed to move QCOW2 to $FINAL_PATH (check permissions)" >&2
+        restore_backup "$FINAL_PATH"
         exit 1
     fi
     # Secure disk permissions even on --no-create: 640 (owner rw, group r)
-    # not 644. Without this the early exit at 267 skipped the chmod 640 at
-    # 291-292, leaving the QCOW2 world-readable when pool is traversable
-    # (e.g. ~/VMs 755). See also temp dir fix at 117.
+    # not 644, otherwise the convert-only branch would leave the QCOW2
+    # world-readable when the pool is traversable (e.g. ~/VMs 755).
+    # See also the temp-dir hardening above.
     chmod 640 -- "$FINAL_PATH" 2>/dev/null || chmod 600 -- "$FINAL_PATH" 2>/dev/null || true
     chgrp libvirt -- "$FINAL_PATH" 2>/dev/null || chgrp qemu -- "$FINAL_PATH" 2>/dev/null || true
     # Refresh pool if it's a libvirt pool
@@ -371,6 +429,8 @@ if [[ $NO_CREATE -eq 1 ]]; then
             break
         fi
     done
+    # New image is in place and valid — only now drop the backup (if any).
+    drop_backup
     echo "Done (no-create): $FINAL_PATH" | stdbuf -oL cat
     exit 0
 fi
@@ -384,12 +444,14 @@ fi
 
 FINAL_PATH="$POOL_PATH/$QCOW2_FILE_NAME"
 echo "Moving converted disk to $FINAL_PATH..." | stdbuf -oL cat
-if [[ -f "$FINAL_PATH" ]]; then
-    echo "Warning: $FINAL_PATH already exists, will overwrite" >&2 | stdbuf -oL cat
-    rm -f -- "$FINAL_PATH"
-fi
+# Refuse an existing destination by default; with --overwrite the old disk
+# is moved to a .pre-import backup and only dropped after virt-install
+# succeeds, so a colliding VM name cannot destroy the prior guest disk
+# before we know the new VM operation works.
+refuse_or_backup_existing "$FINAL_PATH"
 if ! mv -- "$QCOW2_TEMP_PATH" "$FINAL_PATH"; then
     echo "Error: Failed to move QCOW2 to $FINAL_PATH" >&2
+    restore_backup "$FINAL_PATH"
     exit 1
 fi
 # Secure disk permissions: 640 not 644 — 644 made guest FS world-readable
@@ -415,9 +477,19 @@ echo "Creating KVM VM $VM_NAME (memory $MEMORY MB, vcpus $VCPUS, os-variant $OS_
 # Use stdbuf for virt-install progress
 if ! stdbuf -oL virt-install --connect qemu:///system --name "$VM_NAME" --memory "$MEMORY" --vcpus "$VCPUS" --disk "path=$FINAL_PATH,device=disk,bus=virtio" --import --os-variant "$OS_VARIANT" --network network=default,model=virtio --graphics vnc,listen=127.0.0.1 --noautoconsole 2>&1 | stdbuf -oL cat; then
     echo "Error: virt-install failed (see above)" >&2
-    echo "Disk is available at: $FINAL_PATH" >&2
+    # Do not leave a half-imported disk in place of the previous one: remove
+    # the new image and restore the backup so the prior guest disk survives
+    # a failed VM creation.
+    if [[ -n "$BACKUP_PATH" && ( -e "$BACKUP_PATH" || -L "$BACKUP_PATH" ) ]]; then
+        rm -f -- "$FINAL_PATH" 2>/dev/null || true
+        restore_backup "$FINAL_PATH"
+    else
+        echo "Disk is available at: $FINAL_PATH" >&2
+    fi
     exit 1
 fi
+# VM creation succeeded — only now drop the backup (if any).
+drop_backup
 
 echo "----------------------------------------------------------------" | stdbuf -oL cat
 echo "VM '$VM_NAME' created successfully." | stdbuf -oL cat
