@@ -101,12 +101,24 @@ drop_backup() {
     BACKUP_PATH=""
 }
 
+# join_bounded <dir> <leaf-name>: join a leaf file name onto a directory.
+# Refuses empty names, names containing '/', and '.'/'..', so the result
+# can never escape <dir> (no canonicalization needed: without '/' the join
+# is a single path component). Used for every derived output path.
+join_bounded() {
+    local dir="$1" name="$2"
+    if [[ -z "$name" || "$name" == *"/"* || "$name" == "." || "$name" == ".." ]]; then
+        echo "Error: Refusing unsafe file name '$name' (must be a plain leaf name without '/')." >&2
+        exit 1
+    fi
+    printf '%s/%s\n' "$dir" "$name"
+}
+
 # Validation
 if [[ -z "$FILE" ]]; then echo "Error: --file is required" >&2; usage; fi
 if [[ ! -f "$FILE" ]]; then echo "Error: File not found: $FILE" >&2; exit 1; fi
 if [[ $NO_CREATE -eq 0 ]]; then
     if [[ -z "$VM_NAME" ]]; then echo "Error: --vm-name is required (unless --no-create)" >&2; usage; fi
-    if ! [[ "$VM_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then echo "Error: Invalid VM name: $VM_NAME (allowed: alnum, ., _, -)" >&2; exit 1; fi
     if [[ -z "$MEMORY" ]] || ! [[ "$MEMORY" =~ ^[0-9]+$ ]]; then echo "Error: Invalid --memory: $MEMORY" >&2; exit 1; fi
     if [[ -z "$VCPUS" ]] || ! [[ "$VCPUS" =~ ^[0-9]+$ ]]; then echo "Error: Invalid --vcpus: $VCPUS" >&2; exit 1; fi
     if [[ -z "$POOL_PATH" ]]; then echo "Error: --pool-path is required" >&2; usage; fi
@@ -116,12 +128,22 @@ else
     # --no-create: only need file and pool-path for output location
     if [[ -z "$POOL_PATH" ]]; then echo "Error: --pool-path is required (even with --no-create)" >&2; usage; fi
     if [[ ! -d "$POOL_PATH" ]]; then echo "Error: Pool path not found: $POOL_PATH" >&2; exit 1; fi
-    # Use file basename for output name if vm-name not provided
+    # Use file basename for output name if vm-name not provided (safe
+    # charset by construction, still re-validated below like any input)
     if [[ -z "$VM_NAME" ]]; then
         VM_NAME="$(basename "${FILE%.*}" | tr -dc '[:alnum:]-')"
         VM_NAME=${VM_NAME:-converted}
     fi
 fi
+# VM-name/path boundary enforced in BOTH modes, before any path is derived
+# from it (QCOW2_TEMP_PATH/FINAL_PATH) and well before conversion. Without
+# this, a --no-create name containing ../ escapes TEMP_DIR (qemu-img convert
+# target) and the selected pool (FINAL_PATH), truncating arbitrary writable
+# .qcow2 files. The charset excludes '/' entirely; '.'/'..' are rejected
+# explicitly (the panel passes its editable VM name with --no-create).
+if [[ -z "$VM_NAME" ]]; then echo "Error: --vm-name is required" >&2; usage; fi
+if ! [[ "$VM_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then echo "Error: Invalid VM name: $VM_NAME (allowed: alnum, ., _, -; no '/' so paths cannot escape)" >&2; exit 1; fi
+if [[ "$VM_NAME" == "." || "$VM_NAME" == ".." ]]; then echo "Error: Invalid VM name: $VM_NAME" >&2; exit 1; fi
 
 # Dependency checks
 for cmd in qemu-img virsh; do
@@ -279,13 +301,10 @@ run_with_write_cap() {
 
 # Determine input type and prepare VMDK
 VMDK_FILE=""
+# VM_NAME is validated above (no '/', not '.'/'..'), so these joins cannot
+# escape their directories; join_bounded re-checks defensively.
 QCOW2_FILE_NAME="${VM_NAME}.qcow2"
-# If --no-create and VM_NAME derived from file, use that
-if [[ "$QCOW2_FILE_NAME" == ".qcow2" ]]; then
-    QCOW2_FILE_NAME="$(basename "${FILE%.*}").qcow2"
-    [[ "$QCOW2_FILE_NAME" == ".qcow2" ]] && QCOW2_FILE_NAME="converted.qcow2"
-fi
-QCOW2_TEMP_PATH="$TEMP_DIR/$QCOW2_FILE_NAME"
+QCOW2_TEMP_PATH="$(join_bounded "$TEMP_DIR" "$QCOW2_FILE_NAME")"
 
 # Autodetect: if file is already .vmdk or .vmdk.gz, skip tar extraction
 IS_VMDK=0
@@ -595,7 +614,7 @@ chgrp libvirt "$QCOW2_TEMP_PATH" 2>/dev/null || chgrp qemu "$QCOW2_TEMP_PATH" 2>
 
 # If --no-create, just move to pool and exit
 if [[ $NO_CREATE -eq 1 ]]; then
-    FINAL_PATH="$POOL_PATH/$QCOW2_FILE_NAME"
+    FINAL_PATH="$(join_bounded "$POOL_PATH" "$QCOW2_FILE_NAME")"
     echo "Moving converted disk to $FINAL_PATH (no-create)..." | stdbuf -oL cat
     # Ensure pool path is writable (user has write rights, avoid sudo)
     if [[ ! -w "$POOL_PATH" ]]; then
@@ -644,7 +663,7 @@ if [[ ! -w "$POOL_PATH" ]]; then
     exit 1
 fi
 
-FINAL_PATH="$POOL_PATH/$QCOW2_FILE_NAME"
+FINAL_PATH="$(join_bounded "$POOL_PATH" "$QCOW2_FILE_NAME")"
 echo "Moving converted disk to $FINAL_PATH..." | stdbuf -oL cat
 # Refuse an existing destination by default; with --overwrite the old disk
 # is moved to a .pre-import backup and only dropped after virt-install
