@@ -296,11 +296,65 @@ if [[ $IS_VMDK -eq 1 ]]; then
     if ls "$VMDK_DIR"/"$VMDK_BASE"-s001.vmdk >/dev/null 2>&1; then SPLIT_FOUND=1; fi
     if [[ $SPLIT_FOUND -eq 1 ]]; then
         echo "Detected split VMDK, copying all parts to temp dir..." | stdbuf -oL cat
-        # Copy all related VMDK files for this base
+        # Bound the part set first: enumerate explicitly (no blind glob into
+        # cp), sum exact sizes via stat, and enforce free space + a live
+        # write cap. An uncapped 'cp *.vmdk' of a large or attacker-supplied
+        # split set could otherwise exhaust this filesystem before
+        # conversion, with no check at all. Sizes here are exact (stat, not
+        # estimates), so no absolute hard cap is needed — but refuse when a
+        # part cannot be sized (fail closed).
         shopt -s nullglob
-        cp -- "$VMDK_DIR"/"$VMDK_BASE"*.vmdk "$TEMP_DIR"/ 2>/dev/null || cp -- "$FILE" "$TEMP_DIR"/
+        SPLIT_PARTS=( "$VMDK_DIR"/"$VMDK_BASE"*.vmdk )
         shopt -u nullglob
+        SPLIT_TOTAL=0
+        for p in "${SPLIT_PARTS[@]}"; do
+            if [[ ! -f "$p" || -L "$p" ]]; then
+                echo "Error: Split part is not a regular file: $p (refusing unbounded copy)" >&2
+                exit 1
+            fi
+            # NOTE: '|| true' — under 'set -o pipefail' a failing stat would
+            # otherwise abort via 'set -e' before the fail-closed check runs.
+            PSZ=$(stat -c%s -- "$p" 2>/dev/null || stat -f%z -- "$p" 2>/dev/null || echo 0 || true)
+            PSZ=${PSZ:-0}
+            if [[ "$PSZ" -le 0 ]]; then
+                echo "Error: Cannot size split part $p — refusing to copy an unbounded set." >&2
+                exit 1
+            fi
+            SPLIT_TOTAL=$((SPLIT_TOTAL + PSZ))
+        done
+        if [[ "${#SPLIT_PARTS[@]}" -eq 0 || "$SPLIT_TOTAL" -le 0 ]]; then
+            echo "Error: Split VMDK set is empty or unsizable — refusing." >&2
+            exit 1
+        fi
+        # stat reports apparent size, so sparse parts are over-counted: safe
+        # direction (may refuse, never overflows). Need parts + converted
+        # qcow2 (~parts again) + 200MiB headroom.
+        AVAIL_SPLIT=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+        NEED_SPLIT=$((SPLIT_TOTAL + SPLIT_TOTAL + 200*1024*1024))
+        if [[ "$AVAIL_SPLIT" -gt 0 && "$AVAIL_SPLIT" -lt "$NEED_SPLIT" ]]; then
+            echo "Error: Not enough space for split VMDK set (need ~$(numfmt --to=iec "$NEED_SPLIT" 2>/dev/null || echo "$NEED_SPLIT") for ${#SPLIT_PARTS[@]} parts + conversion, avail $(numfmt --to=iec "$AVAIL_SPLIT" 2>/dev/null || echo "$AVAIL_SPLIT") in $TEMP_DIR). Free space or use a larger pool." >&2
+            exit 1
+        fi
+        echo "Split set: ${#SPLIT_PARTS[@]} parts, $(numfmt --to=iec "$SPLIT_TOTAL" 2>/dev/null || echo "$SPLIT_TOTAL bytes") (avail $(numfmt --to=iec "$AVAIL_SPLIT" 2>/dev/null || echo "$AVAIL_SPLIT"))" | stdbuf -oL cat
+        # Write-capped + time-bounded copy (10 min). --sparse=always keeps
+        # sparse parts small; the cap still bounds apparent bytes.
+        rc=0
+        run_with_write_cap "$((SPLIT_TOTAL + 200*1024*1024))" 600 -- cp --sparse=always -- "${SPLIT_PARTS[@]}" "$TEMP_DIR"/ || rc=$?
+        if (( rc != 0 )); then
+            if [[ "$rc" -eq 124 ]]; then
+                echo "Error: Split VMDK copy timed out after 10 min." >&2
+            elif [[ "$rc" -eq 137 ]]; then
+                echo "Error: Split VMDK copy exceeded write cap (likely bomb)." >&2
+            else
+                echo "Error: Split VMDK copy failed (exit $rc) — old pool disk untouched." >&2
+            fi
+            exit 1
+        fi
         VMDK_FILE="$TEMP_DIR/$(basename "$FILE")"
+        if [[ ! -f "$VMDK_FILE" ]]; then
+            echo "Error: Expected part $(basename "$FILE") missing after copy — refusing." >&2
+            exit 1
+        fi
         echo "Copied split VMDK set to $TEMP_DIR" | stdbuf -oL cat
         ls -lh "$TEMP_DIR"/*.vmdk 2>&1 | stdbuf -oL cat || true
     else
@@ -311,7 +365,32 @@ if [[ $IS_VMDK -eq 1 ]]; then
             echo "Using original VMDK path: $VMDK_FILE" | stdbuf -oL cat
         else
             VMDK_FILE="$TEMP_DIR/$(basename "$FILE")"
-            cp -- "$FILE" "$VMDK_FILE"
+            # Same bounding as the split set: exact stat size, free-space
+            # check and live write cap instead of an uncapped cp.
+            COPY_SIZE=$(stat -c%s -- "$FILE" 2>/dev/null || stat -f%z -- "$FILE" 2>/dev/null || echo 0 || true)
+            COPY_SIZE=${COPY_SIZE:-0}
+            if [[ "$COPY_SIZE" -le 0 ]]; then
+                echo "Error: Cannot size $FILE — refusing to copy an unbounded file." >&2
+                exit 1
+            fi
+            AVAIL_CP=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+            NEED_CP=$((COPY_SIZE + COPY_SIZE + 200*1024*1024))
+            if [[ "$AVAIL_CP" -gt 0 && "$AVAIL_CP" -lt "$NEED_CP" ]]; then
+                echo "Error: Not enough space to copy VMDK (need ~$(numfmt --to=iec "$NEED_CP" 2>/dev/null || echo "$NEED_CP"), avail $(numfmt --to=iec "$AVAIL_CP" 2>/dev/null || echo "$AVAIL_CP") in $TEMP_DIR)." >&2
+                exit 1
+            fi
+            rc=0
+            run_with_write_cap "$((COPY_SIZE + 200*1024*1024))" 600 -- cp --sparse=always -- "$FILE" "$VMDK_FILE" || rc=$?
+            if (( rc != 0 )); then
+                if [[ "$rc" -eq 124 ]]; then
+                    echo "Error: VMDK copy timed out after 10 min." >&2
+                elif [[ "$rc" -eq 137 ]]; then
+                    echo "Error: VMDK copy exceeded write cap (likely bomb)." >&2
+                else
+                    echo "Error: VMDK copy failed (exit $rc)." >&2
+                fi
+                exit 1
+            fi
             echo "Copied single VMDK to $VMDK_FILE" | stdbuf -oL cat
         fi
     fi
