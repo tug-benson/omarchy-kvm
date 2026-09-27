@@ -193,6 +193,69 @@ fi
 
 echo "Working in temp dir: $TEMP_DIR" | stdbuf -oL cat
 
+# run_with_write_cap <cap_bytes> <timeout_secs> -- <command...>
+# Runs <command> with a kernel-enforced per-file size cap (ulimit -f, i.e.
+# RLIMIT_FSIZE → SIGXFSZ, synchronous, no poll race) plus a polling watchdog
+# on TEMP_DIR aggregate growth for the multi-file case. A timeout alone does
+# not cap bytes written, and polling alone can miss a sub-second burst, so a
+# crafted archive whose listing and extraction diverge could otherwise fill
+# the filesystem. Kill on cap overrun (returns 137) or timeout (returns 124,
+# mirroring timeout(1)); otherwise returns the command's exit code.
+run_with_write_cap() {
+    local cap_bytes="$1"; shift
+    local timeout_secs="$1"; shift
+    if [[ "${1:-}" == "--" ]]; then shift; fi
+    if [[ "${cap_bytes:-0}" -le 0 ]]; then
+        echo "Error: refusing to run an unbounded write step (cap=$cap_bytes)." >&2
+        return 1
+    fi
+    local step_log="$TEMP_DIR/.bounded-step.log"
+    : > "$step_log" 2>/dev/null || true
+    local base used rc=0 start=$SECONDS
+    base=$(du -sb "$TEMP_DIR" 2>/dev/null | cut -f1); base=${base:-0}
+    # Kernel per-file cap, exact bytes via prlimit (RLIMIT_FSIZE → SIGXFSZ,
+    # synchronous, no poll race). Applies per file written by the child (the
+    # step log itself is tiny); aggregate across files is covered by the
+    # polling watchdog below. (ulimit -f is NOT used: its block factor is
+    # shell-dependent — observed 1024 here vs documented 512 — so it cannot
+    # express an exact byte cap; prlimit from util-linux can.)
+    if command -v prlimit >/dev/null 2>&1; then
+        ( prlimit --fsize="$cap_bytes" -- "$@" ) >"$step_log" 2>&1 &
+    else
+        echo "Warning: prlimit missing — per-file byte cap unavailable, aggregate watchdog only." >&2
+        "$@" >"$step_log" 2>&1 &
+    fi
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( SECONDS - start >= timeout_secs )); then
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            cat "$step_log" 2>/dev/null || true
+            echo "Error: operation timed out after ${timeout_secs}s (likely bomb or very large archive)." >&2
+            return 124
+        fi
+        used=$(du -sb "$TEMP_DIR" 2>/dev/null | cut -f1); used=${used:-0}
+        if (( used - base > cap_bytes )); then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            cat "$step_log" 2>/dev/null || true
+            echo "Error: operation exceeded enforced write cap of $cap_bytes bytes in $TEMP_DIR — refusing (likely bomb)." >&2
+            return 137
+        fi
+        sleep 0.5
+    done
+    wait "$pid" || rc=$?
+    cat "$step_log" 2>/dev/null || true
+    if (( rc == 153 )); then
+        # 128+SIGXFSZ(25): child hit the kernel per-file write cap above.
+        echo "Error: operation exceeded enforced per-file write cap of $cap_bytes bytes — refusing (likely bomb)." >&2
+        return 137
+    fi
+    return $rc
+}
+
 # Determine input type and prepare VMDK
 VMDK_FILE=""
 QCOW2_FILE_NAME="${VM_NAME}.qcow2"
@@ -253,76 +316,89 @@ if [[ $IS_VMDK -eq 1 ]]; then
 elif [[ $IS_VMDK_GZ -eq 1 ]]; then
     echo "Input is VMDK.GZ, decompressing..." | stdbuf -oL cat
     VMDK_FILE="$TEMP_DIR/$(basename "${FILE%.gz}")"
-    # Enforce decompression size and time limit (gzip bomb). gzip -l gives
+    # Enforce decompression size and write cap (gzip bomb). gzip -l gives
     # uncompressed size in field 2; compare to available space and 80 GiB cap.
-    if command -v gzip >/dev/null 2>&1; then
-        GZ_UNCOMP=$(gzip -l -- "$FILE" 2>/dev/null | awk 'NR==2 {print $2+0}')
-        if [[ "${GZ_UNCOMP:-0}" -gt 0 ]]; then
-            AVAIL_GZ=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
-            HARD_GZ=$((80*1024*1024*1024))
-            if [[ "$GZ_UNCOMP" -gt "$HARD_GZ" ]]; then
-                echo "Error: VMDK.GZ uncompressed size $GZ_UNCOMP bytes (>80 GiB) — refusing (likely bomb)." >&2
-                exit 1
-            fi
-            if [[ "$AVAIL_GZ" -gt 0 && "$AVAIL_GZ" -lt "$((GZ_UNCOMP + 200*1024*1024))" ]]; then
-                echo "Error: Not enough space to decompress VMDK.GZ (need ~$GZ_UNCOMP bytes + 200MiB, avail $AVAIL_GZ in $TEMP_DIR)." >&2
-                exit 1
-            fi
-        fi
+    # Fail closed when the size is unknown: without a bound we cannot cap
+    # bytes written, so refuse instead of decompressing blindly.
+    GZ_UNCOMP=$(gzip -l -- "$FILE" 2>/dev/null | awk 'NR==2 {print $2+0}')
+    GZ_UNCOMP=${GZ_UNCOMP:-0}
+    if [[ "$GZ_UNCOMP" -le 0 ]]; then
+        echo "Error: Cannot determine VMDK.GZ uncompressed size (gzip -l failed) — refusing to decompress an unbounded archive." >&2
+        exit 1
     fi
-    # Time-bounded decompression (10 min)
-    if command -v timeout >/dev/null 2>&1; then
-        if ! timeout --preserve-status --kill-after=30 600 bash -c 'gzip -dc -- "$1" > "$2"' _ "$FILE" "$VMDK_FILE" 2>&1 | stdbuf -oL cat; then
-            rc=${PIPESTATUS[0]:-$?}
-            echo "Error: gzip decompression failed or timed out (exit $rc, likely bomb)." >&2
-            exit 1
+    AVAIL_GZ=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+    HARD_GZ=$((80*1024*1024*1024))
+    if [[ "$GZ_UNCOMP" -gt "$HARD_GZ" ]]; then
+        echo "Error: VMDK.GZ uncompressed size $GZ_UNCOMP bytes (>80 GiB) — refusing (likely bomb)." >&2
+        exit 1
+    fi
+    if [[ "$AVAIL_GZ" -gt 0 && "$AVAIL_GZ" -lt "$((GZ_UNCOMP + 200*1024*1024))" ]]; then
+        echo "Error: Not enough space to decompress VMDK.GZ (need ~$GZ_UNCOMP bytes + 200MiB, avail $AVAIL_GZ in $TEMP_DIR)." >&2
+        exit 1
+    fi
+    # Write-capped + time-bounded decompression (10 min). NOTE: capture rc
+    # via '|| rc=$?' — 'if ! cmd; then rc=$?' would read the negated
+    # status (0), not the command's code.
+    rc=0
+    run_with_write_cap "$((GZ_UNCOMP + 200*1024*1024))" 600 -- bash -c 'gzip -dc -- "$1" > "$2"' _ "$FILE" "$VMDK_FILE" || rc=$?
+    if (( rc != 0 )); then
+        if [[ "$rc" -eq 124 ]]; then
+            echo "Error: gzip decompression timed out after 10 min (likely bomb)." >&2
+        elif [[ "$rc" -eq 137 ]]; then
+            echo "Error: gzip decompression exceeded write cap (likely bomb; header size diverged from actual output)." >&2
+        else
+            echo "Error: gzip decompression failed (exit $rc)." >&2
         fi
-    else
-        gzip -dc -- "$FILE" > "$VMDK_FILE"
+        exit 1
     fi
     echo "Decompressed to $VMDK_FILE" | stdbuf -oL cat
 else
-    # Assume OVA (tar archive) — enforce expansion-size and time limit.
-    # The early check at :80-97 only sees compressed size; a zip-bomb can be
+    # Assume OVA (tar archive) — enforce expansion-size, write cap and time
+    # limit. The early check only sees compressed size; a zip-bomb can be
     # tiny on disk but expand to fill the filesystem. Before tar -xf, sum the
-    # uncompressed members via tar -tvf and compare to free space in TEMP_DIR,
-    # and wrap extraction in timeout so a decompression bomb cannot hang the
-    # import indefinitely.
+    # uncompressed members via tar -tvf and compare to free space in TEMP_DIR.
+    # Fail closed when the listing fails or yields no boundable size: an
+    # archive that errors after an oversized member must never reach tar -xf,
+    # and the extraction itself runs under a live write cap (a timeout alone
+    # does not cap bytes written).
     echo "Extracting OVA $FILE to $TEMP_DIR..." | stdbuf -oL cat
     if ! tar -tf "$FILE" >/dev/null 2>&1; then
-        echo "Warning: File does not appear to be a valid tar archive, trying anyway..." >&2 | stdbuf -oL cat
-    else
-        # Enforce expansion-size: sum member sizes (field 3 of tar -tvf)
-        # GNU tar format: "-rw-r--r-- user/group 12345 2024-... name"
-        TAR_TOTAL=$(tar -tvf "$FILE" 2>/dev/null | awk '{s+=$3} END {print s+0}')
-        TAR_TOTAL=${TAR_TOTAL:-0}
-        if [[ "$TAR_TOTAL" -gt 0 ]]; then
-            AVAIL_TMP=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
-            # Need decompressed + converted qcow2 roughly 2x, keep 200MiB headroom
-            NEED_TAR=$((TAR_TOTAL + TAR_TOTAL + 200*1024*1024))
-            # Also enforce absolute cap (e.g. 80 GiB uncompressed is already
-            # generous: Kali OVA ~15 GiB -> ~40 GiB qcow2; larger likely a bomb)
-            HARD_CAP=$((80*1024*1024*1024))
-            if [[ "$TAR_TOTAL" -gt "$HARD_CAP" ]]; then
-                echo "Error: OVA uncompressed content $TAR_TOTAL bytes (>80 GiB) — refusing (likely bomb or unsupported)." >&2
-                exit 1
-            fi
-            if [[ "$AVAIL_TMP" -gt 0 && "$AVAIL_TMP" -lt "$NEED_TAR" ]]; then
-                echo "Error: Not enough space to extract OVA (need ~$(numfmt --to=iec "$NEED_TAR" 2>/dev/null || echo "$NEED_TAR") for $TAR_TOTAL bytes + conversion, avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP") in $TEMP_DIR). Free space or use a larger pool." >&2
-                exit 1
-            fi
-            echo "OVA content size: $(numfmt --to=iec "$TAR_TOTAL" 2>/dev/null || echo "$TAR_TOTAL bytes") (avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP"))" | stdbuf -oL cat
-        fi
+        echo "Error: File is not a valid tar archive (tar -tf failed) — refusing to extract an unbounded archive." >&2
+        exit 1
     fi
-    # Time-bounded extraction: 10 min for typical OVAs; kills zip-bomb loops
-    TAR_CMD=(tar -xf "$FILE" -C "$TEMP_DIR")
-    if command -v timeout >/dev/null 2>&1; then
-        TAR_CMD=(timeout --preserve-status --kill-after=30 600 tar -xf "$FILE" -C "$TEMP_DIR")
+    # Enforce expansion-size: sum member sizes (field 3 of tar -tvf)
+    # GNU tar format: "-rw-r--r-- user/group 12345 2024-... name"
+    TAR_TOTAL=$(tar -tvf "$FILE" 2>/dev/null | awk '{s+=$3} END {print s+0}')
+    TAR_TOTAL=${TAR_TOTAL:-0}
+    if [[ "$TAR_TOTAL" -le 0 ]]; then
+        echo "Error: Cannot bound OVA uncompressed size (empty or unreadable member list) — refusing to extract an unbounded archive." >&2
+        exit 1
     fi
-    if ! "${TAR_CMD[@]}" 2>&1 | stdbuf -oL cat; then
-        rc=${PIPESTATUS[0]:-$?}
-        if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+    AVAIL_TMP=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+    # Need decompressed + converted qcow2 roughly 2x, keep 200MiB headroom
+    NEED_TAR=$((TAR_TOTAL + TAR_TOTAL + 200*1024*1024))
+    # Also enforce absolute cap (e.g. 80 GiB uncompressed is already
+    # generous: Kali OVA ~15 GiB -> ~40 GiB qcow2; larger likely a bomb)
+    HARD_CAP=$((80*1024*1024*1024))
+    if [[ "$TAR_TOTAL" -gt "$HARD_CAP" ]]; then
+        echo "Error: OVA uncompressed content $TAR_TOTAL bytes (>80 GiB) — refusing (likely bomb or unsupported)." >&2
+        exit 1
+    fi
+    if [[ "$AVAIL_TMP" -gt 0 && "$AVAIL_TMP" -lt "$NEED_TAR" ]]; then
+        echo "Error: Not enough space to extract OVA (need ~$(numfmt --to=iec "$NEED_TAR" 2>/dev/null || echo "$NEED_TAR") for $TAR_TOTAL bytes + conversion, avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP") in $TEMP_DIR). Free space or use a larger pool." >&2
+        exit 1
+    fi
+    echo "OVA content size: $(numfmt --to=iec "$TAR_TOTAL" 2>/dev/null || echo "$TAR_TOTAL bytes") (avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP"))" | stdbuf -oL cat
+    # Write-capped + time-bounded extraction (10 min): kills the runaway even
+    # when listing and extraction diverge. NOTE: capture rc via '|| rc=$?'
+    # ('if ! cmd; then rc=$?' would read the negated status, 0).
+    rc=0
+    run_with_write_cap "$NEED_TAR" 600 -- tar -xf "$FILE" -C "$TEMP_DIR" || rc=$?
+    if (( rc != 0 )); then
+        if [[ "$rc" -eq 124 ]]; then
             echo "Error: OVA extraction timed out after 10 min (likely bomb or very large archive)." >&2
+        elif [[ "$rc" -eq 137 ]]; then
+            echo "Error: OVA extraction exceeded write cap of $NEED_TAR bytes (listing diverged from actual output; likely bomb)." >&2
         else
             echo "Error: Failed to extract OVA archive (exit $rc)" >&2
         fi
@@ -333,14 +409,20 @@ else
     VMDK_FILE=$(find "$TEMP_DIR" -name "*.vmdk.gz" -print -quit 2>/dev/null || true)
     if [[ -n "$VMDK_FILE" && -f "$VMDK_FILE" ]]; then
         echo "Decompressing $VMDK_FILE..." | stdbuf -oL cat
-        # Time-bounded (inherits size limit from TAR_TOTAL check above)
-        if command -v timeout >/dev/null 2>&1; then
-            if ! timeout --preserve-status --kill-after=30 600 gunzip -- "$VMDK_FILE" 2>&1 | stdbuf -oL cat; then
-                echo "Error: gunzip of embedded VMDK.GZ failed or timed out." >&2
-                exit 1
+        # Write-capped + time-bounded (bound inherited from TAR_TOTAL above;
+        # cap fits the space verified before extraction). NOTE: rc via
+        # '|| rc=$?' ('if ! cmd' would read the negated status, 0).
+        rc=0
+        run_with_write_cap "$((TAR_TOTAL + 200*1024*1024))" 600 -- gunzip -- "$VMDK_FILE" || rc=$?
+        if (( rc != 0 )); then
+            if [[ "$rc" -eq 124 ]]; then
+                echo "Error: gunzip of embedded VMDK.GZ timed out after 10 min." >&2
+            elif [[ "$rc" -eq 137 ]]; then
+                echo "Error: gunzip of embedded VMDK.GZ exceeded write cap (likely bomb)." >&2
+            else
+                echo "Error: gunzip of embedded VMDK.GZ failed (exit $rc)." >&2
             fi
-        else
-            gunzip -- "$VMDK_FILE"
+            exit 1
         fi
         VMDK_FILE="${VMDK_FILE%.gz}"
     else
