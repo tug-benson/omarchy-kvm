@@ -212,7 +212,9 @@ run_with_write_cap() {
     local step_log="$TEMP_DIR/.bounded-step.log"
     : > "$step_log" 2>/dev/null || true
     local base used rc=0 start=$SECONDS
-    base=$(du -sb "$TEMP_DIR" 2>/dev/null | cut -f1); base=${base:-0}
+    # NOTE: '|| true' — under 'set -o pipefail' a failing du would otherwise
+    # abort via 'set -e' instead of falling back to 0.
+    base=$(du -sb "$TEMP_DIR" 2>/dev/null | cut -f1 || true); base=${base:-0}
     # Kernel per-file cap, exact bytes via prlimit (RLIMIT_FSIZE → SIGXFSZ,
     # synchronous, no poll race). Applies per file written by the child (the
     # step log itself is tiny); aggregate across files is covered by the
@@ -234,7 +236,7 @@ run_with_write_cap() {
             echo "Error: operation timed out after ${timeout_secs}s (likely bomb or very large archive)." >&2
             return 124
         fi
-        used=$(du -sb "$TEMP_DIR" 2>/dev/null | cut -f1); used=${used:-0}
+        used=$(du -sb "$TEMP_DIR" 2>/dev/null | cut -f1 || true); used=${used:-0}
         if (( used - base > cap_bytes )); then
             kill "$pid" 2>/dev/null || true
             sleep 1
@@ -320,7 +322,9 @@ elif [[ $IS_VMDK_GZ -eq 1 ]]; then
     # uncompressed size in field 2; compare to available space and 80 GiB cap.
     # Fail closed when the size is unknown: without a bound we cannot cap
     # bytes written, so refuse instead of decompressing blindly.
-    GZ_UNCOMP=$(gzip -l -- "$FILE" 2>/dev/null | awk 'NR==2 {print $2+0}')
+    # NOTE: '|| true' — under 'set -o pipefail' a failing gzip -l would
+    # otherwise abort via 'set -e' before the fail-closed check below runs.
+    GZ_UNCOMP=$(gzip -l -- "$FILE" 2>/dev/null | awk 'NR==2 {print $2+0}' || true)
     GZ_UNCOMP=${GZ_UNCOMP:-0}
     if [[ "$GZ_UNCOMP" -le 0 ]]; then
         echo "Error: Cannot determine VMDK.GZ uncompressed size (gzip -l failed) — refusing to decompress an unbounded archive." >&2
@@ -368,7 +372,9 @@ else
     fi
     # Enforce expansion-size: sum member sizes (field 3 of tar -tvf)
     # GNU tar format: "-rw-r--r-- user/group 12345 2024-... name"
-    TAR_TOTAL=$(tar -tvf "$FILE" 2>/dev/null | awk '{s+=$3} END {print s+0}')
+    # NOTE: '|| true' — under 'set -o pipefail' a failing tar -tvf would
+    # otherwise abort via 'set -e' before the fail-closed check below runs.
+    TAR_TOTAL=$(tar -tvf "$FILE" 2>/dev/null | awk '{s+=$3} END {print s+0}' || true)
     TAR_TOTAL=${TAR_TOTAL:-0}
     if [[ "$TAR_TOTAL" -le 0 ]]; then
         echo "Error: Cannot bound OVA uncompressed size (empty or unreadable member list) — refusing to extract an unbounded archive." >&2
