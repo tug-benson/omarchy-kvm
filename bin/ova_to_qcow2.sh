@@ -135,22 +135,41 @@ if [[ $NO_CREATE -eq 0 ]] && ! command -v virt-install >/dev/null 2>&1; then
     exit 1
 fi
 
+# avail_bytes <path>: free bytes on <path>'s filesystem, or 0 when df is
+# missing, fails, or prints anything unparseable. All space guards treat 0
+# as UNKNOWN and refuse the unbounded write (fail closed) instead of
+# skipping the check — a guard of the form '[ AVAIL -gt 0 && AVAIL -lt NEED ]'
+# would silently pass when df fails or reports zero.
+avail_bytes() {
+    local out
+    out=$(df --output=avail -B1 "$1" 2>/dev/null | tail -n1 | tr -dc '0-9' || true)
+    echo "${out:-0}"
+}
+
 # Disk space check — enforced (not just a warning). A compressed OVA can
 # be a zip-bomb: small FILE but huge extraction. Check both compressed size
-# and, for tar, total uncompressed size (195-203 also re-checks after TEMP_DIR
+# and, for tar, total uncompressed size (also re-checked after TEMP_DIR
 # is chosen). Fail rather than let tar exhaust the filesystem.
 if command -v df >/dev/null 2>&1; then
     SRC_SIZE=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
     if [[ "$SRC_SIZE" -gt 0 ]]; then
         TMP_PARENT=$(dirname "$(mktemp -u)")
-        AVAIL=$(df --output=avail -B1 "$TMP_PARENT" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+        AVAIL=$(avail_bytes "$TMP_PARENT")
         NEED=$((SRC_SIZE * 2 + 100*1024*1024))
-        if [[ "$AVAIL" -gt 0 && "$AVAIL" -lt "$NEED" ]]; then
+        if [[ "$AVAIL" -le 0 ]]; then
+            echo "Error: Cannot determine free space in $TMP_PARENT (df failed) — refusing an unbounded import." >&2
+            exit 1
+        fi
+        if [[ "$AVAIL" -lt "$NEED" ]]; then
             echo "Error: Insufficient space in $TMP_PARENT (avail $(numfmt --to=iec "$AVAIL" 2>/dev/null || echo "$AVAIL"), need ~$(numfmt --to=iec "$NEED" 2>/dev/null || echo "$NEED") for ~2x source + 100MiB headroom). Free space or pick a larger pool." >&2
             exit 1
         fi
-        POOL_AVAIL=$(df --output=avail -B1 "$POOL_PATH" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
-        if [[ "$POOL_AVAIL" -gt 0 && "$POOL_AVAIL" -lt "$SRC_SIZE" ]]; then
+        POOL_AVAIL=$(avail_bytes "$POOL_PATH")
+        if [[ "$POOL_AVAIL" -le 0 ]]; then
+            echo "Error: Cannot determine free space in pool $POOL_PATH (df failed) — refusing an unbounded import." >&2
+            exit 1
+        fi
+        if [[ "$POOL_AVAIL" -lt "$SRC_SIZE" ]]; then
             echo "Error: Insufficient space in pool $POOL_PATH (avail $(numfmt --to=iec "$POOL_AVAIL" 2>/dev/null || echo "$POOL_AVAIL"), need at least source size). Free space or pick another pool." >&2
             exit 1
         fi
@@ -165,8 +184,8 @@ fi
 
 # Create temp dir owned by current user (no sudo) - use pool path if /tmp too small
 # For large VMDKs (e.g., Kali 15G -> 40G qcow2), /tmp (tmpfs 31G) may be too small
-POOL_AVAIL_TMP=$(df --output=avail -B1 "$POOL_PATH" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
-TMP_AVAIL=$(df --output=avail -B1 "/tmp" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+POOL_AVAIL_TMP=$(avail_bytes "$POOL_PATH")
+TMP_AVAIL=$(avail_bytes "/tmp")
 # If pool has more space than /tmp and is writable, use it for temp
 if [[ "$POOL_AVAIL_TMP" -gt "$TMP_AVAIL" ]] && [[ -w "$POOL_PATH" ]]; then
     TEMP_DIR=$(mktemp -d -p "$POOL_PATH" tmp.ova.XXXXXX 2>/dev/null || mktemp -d)
@@ -194,8 +213,8 @@ fi
 echo "Working in temp dir: $TEMP_DIR" | stdbuf -oL cat
 
 # run_with_write_cap <cap_bytes> <timeout_secs> -- <command...>
-# Runs <command> with a kernel-enforced per-file size cap (ulimit -f, i.e.
-# RLIMIT_FSIZE → SIGXFSZ, synchronous, no poll race) plus a polling watchdog
+# Runs <command> with a kernel-enforced per-file size cap (prlimit --fsize,
+# i.e. RLIMIT_FSIZE → SIGXFSZ, synchronous, no poll race) plus a polling watchdog
 # on TEMP_DIR aggregate growth for the multi-file case. A timeout alone does
 # not cap bytes written, and polling alone can miss a sub-second burst, so a
 # crafted archive whose listing and extraction diverge could otherwise fill
@@ -329,9 +348,13 @@ if [[ $IS_VMDK -eq 1 ]]; then
         # stat reports apparent size, so sparse parts are over-counted: safe
         # direction (may refuse, never overflows). Need parts + converted
         # qcow2 (~parts again) + 200MiB headroom.
-        AVAIL_SPLIT=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+        AVAIL_SPLIT=$(avail_bytes "$TEMP_DIR")
         NEED_SPLIT=$((SPLIT_TOTAL + SPLIT_TOTAL + 200*1024*1024))
-        if [[ "$AVAIL_SPLIT" -gt 0 && "$AVAIL_SPLIT" -lt "$NEED_SPLIT" ]]; then
+        if [[ "$AVAIL_SPLIT" -le 0 ]]; then
+            echo "Error: Cannot determine free space in $TEMP_DIR (df failed) — refusing to copy an unbounded split set." >&2
+            exit 1
+        fi
+        if [[ "$AVAIL_SPLIT" -lt "$NEED_SPLIT" ]]; then
             echo "Error: Not enough space for split VMDK set (need ~$(numfmt --to=iec "$NEED_SPLIT" 2>/dev/null || echo "$NEED_SPLIT") for ${#SPLIT_PARTS[@]} parts + conversion, avail $(numfmt --to=iec "$AVAIL_SPLIT" 2>/dev/null || echo "$AVAIL_SPLIT") in $TEMP_DIR). Free space or use a larger pool." >&2
             exit 1
         fi
@@ -373,9 +396,13 @@ if [[ $IS_VMDK -eq 1 ]]; then
                 echo "Error: Cannot size $FILE — refusing to copy an unbounded file." >&2
                 exit 1
             fi
-            AVAIL_CP=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+            AVAIL_CP=$(avail_bytes "$TEMP_DIR")
             NEED_CP=$((COPY_SIZE + COPY_SIZE + 200*1024*1024))
-            if [[ "$AVAIL_CP" -gt 0 && "$AVAIL_CP" -lt "$NEED_CP" ]]; then
+            if [[ "$AVAIL_CP" -le 0 ]]; then
+                echo "Error: Cannot determine free space in $TEMP_DIR (df failed) — refusing to copy an unbounded file." >&2
+                exit 1
+            fi
+            if [[ "$AVAIL_CP" -lt "$NEED_CP" ]]; then
                 echo "Error: Not enough space to copy VMDK (need ~$(numfmt --to=iec "$NEED_CP" 2>/dev/null || echo "$NEED_CP"), avail $(numfmt --to=iec "$AVAIL_CP" 2>/dev/null || echo "$AVAIL_CP") in $TEMP_DIR)." >&2
                 exit 1
             fi
@@ -409,13 +436,17 @@ elif [[ $IS_VMDK_GZ -eq 1 ]]; then
         echo "Error: Cannot determine VMDK.GZ uncompressed size (gzip -l failed) — refusing to decompress an unbounded archive." >&2
         exit 1
     fi
-    AVAIL_GZ=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+    AVAIL_GZ=$(avail_bytes "$TEMP_DIR")
     HARD_GZ=$((80*1024*1024*1024))
     if [[ "$GZ_UNCOMP" -gt "$HARD_GZ" ]]; then
         echo "Error: VMDK.GZ uncompressed size $GZ_UNCOMP bytes (>80 GiB) — refusing (likely bomb)." >&2
         exit 1
     fi
-    if [[ "$AVAIL_GZ" -gt 0 && "$AVAIL_GZ" -lt "$((GZ_UNCOMP + 200*1024*1024))" ]]; then
+    if [[ "$AVAIL_GZ" -le 0 ]]; then
+        echo "Error: Cannot determine free space in $TEMP_DIR (df failed) — refusing to decompress an unbounded archive." >&2
+        exit 1
+    fi
+    if [[ "$AVAIL_GZ" -lt "$((GZ_UNCOMP + 200*1024*1024))" ]]; then
         echo "Error: Not enough space to decompress VMDK.GZ (need ~$GZ_UNCOMP bytes + 200MiB, avail $AVAIL_GZ in $TEMP_DIR)." >&2
         exit 1
     fi
@@ -459,7 +490,7 @@ else
         echo "Error: Cannot bound OVA uncompressed size (empty or unreadable member list) — refusing to extract an unbounded archive." >&2
         exit 1
     fi
-    AVAIL_TMP=$(df --output=avail -B1 "$TEMP_DIR" 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+    AVAIL_TMP=$(avail_bytes "$TEMP_DIR")
     # Need decompressed + converted qcow2 roughly 2x, keep 200MiB headroom
     NEED_TAR=$((TAR_TOTAL + TAR_TOTAL + 200*1024*1024))
     # Also enforce absolute cap (e.g. 80 GiB uncompressed is already
@@ -469,7 +500,11 @@ else
         echo "Error: OVA uncompressed content $TAR_TOTAL bytes (>80 GiB) — refusing (likely bomb or unsupported)." >&2
         exit 1
     fi
-    if [[ "$AVAIL_TMP" -gt 0 && "$AVAIL_TMP" -lt "$NEED_TAR" ]]; then
+    if [[ "$AVAIL_TMP" -le 0 ]]; then
+        echo "Error: Cannot determine free space in $TEMP_DIR (df failed) — refusing to extract an unbounded archive." >&2
+        exit 1
+    fi
+    if [[ "$AVAIL_TMP" -lt "$NEED_TAR" ]]; then
         echo "Error: Not enough space to extract OVA (need ~$(numfmt --to=iec "$NEED_TAR" 2>/dev/null || echo "$NEED_TAR") for $TAR_TOTAL bytes + conversion, avail $(numfmt --to=iec "$AVAIL_TMP" 2>/dev/null || echo "$AVAIL_TMP") in $TEMP_DIR). Free space or use a larger pool." >&2
         exit 1
     fi
